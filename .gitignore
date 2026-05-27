@@ -1,0 +1,24 @@
+# Env / secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local cache
+.DS_Store
+
+# Editor / OS
+.vscode/
+.idea/
+
+# Project data — chat exports may contain residual PII
+raw dada/
+cleaned/
+cleaned_data/

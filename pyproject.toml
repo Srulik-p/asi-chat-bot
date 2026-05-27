@@ -1,0 +1,10 @@
+[project]
+name = "sugar-daddy-assistant"
+version = "0.1.0"
+description = "Customer-service assistant for sugardaddy.co.il"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.50.0",
+    "python-dotenv>=1.0.0",
+    "streamlit>=1.39.0",
+]

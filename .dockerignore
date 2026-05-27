@@ -1,0 +1,32 @@
+# Local Python artifacts
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets — must never enter the image
+.env
+.env.*
+!.env.example
+
+# Project data (large + PII risk)
+raw dada/
+cleaned/
+cleaned_data/
+
+# Dev-only files not needed at runtime
+clean_chats.py
+qa_patterns.md
+requirements.txt
+
+# Build / OS / editor
+.DS_Store
+.git/
+.gitignore
+.claude/
+.vscode/
+.idea/
+
+# Docker itself
+Dockerfile
+.dockerignore
