@@ -6,7 +6,14 @@ Run with:
 
 import streamlit as st
 
-from assistant import MODEL, SYSTEM_PROMPT, client
+from assistant import (
+    MODEL,
+    SYSTEM_PROMPT,
+    TOOLS,
+    _usage_dict,
+    client,
+    resolve_tool_calls,
+)
 
 
 st.set_page_config(
@@ -71,31 +78,37 @@ if "stats" not in st.session_state:
 
 
 def stream_reply(messages):
-    """Yield delta chunks; stash final usage in session_state at end."""
-    with client.chat.completions.stream(
-        model=MODEL,
-        messages=messages,
-        stream_options={"include_usage": True},
-    ) as s:
-        for event in s:
-            if event.type == "content.delta":
-                yield event.delta
-        final = s.get_final_completion()
+    """Yield delta chunks of the final answer; stash summed usage at end.
 
-    usage = getattr(final, "usage", None)
-    if usage is None:
-        st.session_state._last_usage = None
+    The model may call read_kb to pull topic files before answering, so this
+    loops over rounds. Tool-call rounds emit no visible text (so nothing is
+    yielded); the final answer streams to the user. Token usage is summed
+    across every round for honest stats.
+    """
+    total = {"prompt": 0, "cached": 0, "completion": 0, "total": 0}
+    while True:
+        with client.chat.completions.stream(
+            model=MODEL,
+            messages=messages,
+            tools=TOOLS,
+            stream_options={"include_usage": True},
+        ) as s:
+            for event in s:
+                if event.type == "content.delta":
+                    yield event.delta
+            final = s.get_final_completion()
+
+        usage = _usage_dict(getattr(final, "usage", None))
+        for key in total:
+            total[key] += usage[key]
+
+        msg = final.choices[0].message
+        if msg.tool_calls:
+            resolve_tool_calls(messages, msg)
+            continue
+
+        st.session_state._last_usage = total
         return
-    cached = 0
-    details = getattr(usage, "prompt_tokens_details", None)
-    if details is not None:
-        cached = getattr(details, "cached_tokens", 0) or 0
-    st.session_state._last_usage = {
-        "prompt": usage.prompt_tokens,
-        "cached": cached,
-        "completion": usage.completion_tokens,
-        "total": usage.total_tokens,
-    }
 
 
 for msg in st.session_state.history:

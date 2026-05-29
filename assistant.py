@@ -13,12 +13,15 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+import kb
 
 
 load_dotenv()
@@ -27,9 +30,47 @@ ROOT = Path(__file__).parent
 SYSTEM_PROMPT_PATH = ROOT / "system_prompt.md"
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
-SYSTEM_PROMPT = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+# Behaviour instructions + the KB index. Both are static, so the whole system
+# prompt stays the cacheable prefix; the model reads topic files on demand via
+# the read_kb tool instead of carrying the full knowledge base every turn.
+SYSTEM_PROMPT = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8") + "\n\n" + kb.build_index()
 
 client = OpenAI()  # picks up OPENAI_API_KEY from env
+
+TOOLS = kb.TOOLS
+TOOL_FNS = {"read_kb": kb.read_kb}
+
+
+def resolve_tool_calls(messages: list[dict], msg) -> None:
+    """Append an assistant turn that requested tools, then each tool result."""
+    messages.append(
+        {
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in msg.tool_calls
+            ],
+        }
+    )
+    for tc in msg.tool_calls:
+        fn = TOOL_FNS.get(tc.function.name)
+        if fn is None:
+            result = f"כלי לא ידוע: {tc.function.name}"
+        else:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+                result = fn(**args)
+            except (json.JSONDecodeError, TypeError) as e:
+                result = f"שגיאה בהפעלת הכלי {tc.function.name}: {e}"
+        messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
 
 def reply(history: list[dict], user_message: str, stream: bool = True) -> tuple[str, dict]:
@@ -37,36 +78,49 @@ def reply(history: list[dict], user_message: str, stream: bool = True) -> tuple[
 
     `history` is the running list of {role, content} dicts (user + assistant
     only — the system prompt is prepended here on every call so it stays the
-    stable prefix that gets cached).
+    stable prefix that gets cached). The model may call `read_kb` to pull topic
+    files before answering, so this runs a short loop (usually 1-2 rounds) and
+    sums token usage across all rounds. A tool-call round emits no visible text;
+    the final answer streams to stdout as before.
     """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         *history,
         {"role": "user", "content": user_message},
     ]
+    total = {"prompt": 0, "cached": 0, "completion": 0, "total": 0}
 
-    if stream:
-        text_parts: list[str] = []
-        with client.chat.completions.stream(
-            model=MODEL,
-            messages=messages,
-            stream_options={"include_usage": True},
-        ) as s:
-            for event in s:
-                if event.type == "content.delta":
-                    sys.stdout.write(event.delta)
-                    sys.stdout.flush()
-                    text_parts.append(event.delta)
-            final = s.get_final_completion()
-        print()
-        text = "".join(text_parts)
-        usage = _usage_dict(getattr(final, "usage", None))
-    else:
-        resp = client.chat.completions.create(model=MODEL, messages=messages)
-        text = resp.choices[0].message.content or ""
-        usage = _usage_dict(resp.usage)
+    while True:
+        if stream:
+            with client.chat.completions.stream(
+                model=MODEL,
+                messages=messages,
+                tools=TOOLS,
+                stream_options={"include_usage": True},
+            ) as s:
+                for event in s:
+                    if event.type == "content.delta":
+                        sys.stdout.write(event.delta)
+                        sys.stdout.flush()
+                final = s.get_final_completion()
+            usage = _usage_dict(getattr(final, "usage", None))
+        else:
+            final = client.chat.completions.create(
+                model=MODEL, messages=messages, tools=TOOLS
+            )
+            usage = _usage_dict(final.usage)
 
-    return text, usage
+        for key in total:
+            total[key] += usage[key]
+
+        msg = final.choices[0].message
+        if msg.tool_calls:
+            resolve_tool_calls(messages, msg)
+            continue
+
+        if stream:
+            print()
+        return msg.content or "", total
 
 
 def _usage_dict(usage) -> dict:
