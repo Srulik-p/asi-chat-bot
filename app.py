@@ -10,19 +10,52 @@ from assistant import MODEL, SYSTEM_PROMPT, client
 
 
 st.set_page_config(
-    page_title="שוגר דדי — שירות לקוחות",
+    page_title="שוגר דדי - שירות לקוחות",
     page_icon="💬",
     layout="centered",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown(
     """
     <style>
+    /* RTL base */
     .stApp { direction: rtl; }
     [data-testid="stChatMessageContent"] { direction: rtl; text-align: right; }
     [data-testid="stChatInput"] textarea { direction: rtl; text-align: right; }
-    [data-testid="stSidebar"] { direction: rtl; text-align: right; }
     [data-testid="stHeader"] { direction: ltr; }
+
+    /* Sidebar - anchor to the right side of the screen for RTL */
+    [data-testid="stSidebar"] {
+        direction: rtl;
+        text-align: right;
+        right: 0;
+        left: auto;
+    }
+    /* When the sidebar slides out (Streamlit transforms it off-screen),
+       push it to the right edge instead of the left */
+    [data-testid="stSidebar"][aria-expanded="false"] {
+        transform: translateX(100%);
+        margin-left: 0;
+    }
+
+    /* Mobile: full-height opaque overlay drawer from the right */
+    @media (max-width: 768px) {
+        [data-testid="stSidebar"] {
+            position: fixed;
+            top: 0;
+            right: 0;
+            left: auto;
+            height: 100vh;
+            width: 85vw;
+            max-width: 340px;
+            background-color: var(--background-color, #0e1117);
+            box-shadow: -2px 0 10px rgba(0, 0, 0, 0.4);
+            z-index: 999;
+        }
+        /* Ensure main content fills the screen instead of leaving sidebar gutter */
+        section[data-testid="stMain"] { padding-right: 0; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
