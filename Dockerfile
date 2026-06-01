@@ -10,7 +10,8 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
 
 # App code.
-COPY app.py assistant.py system_prompt.md ./
+COPY app.py assistant.py kb.py system_prompt.md ./
+COPY knowledge_base/ ./knowledge_base/
 
 ENV PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH"
