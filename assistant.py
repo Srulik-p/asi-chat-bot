@@ -40,13 +40,31 @@ client = OpenAI()  # picks up OPENAI_API_KEY from env
 TOOLS = kb.TOOLS
 TOOL_FNS = {"read_kb": kb.read_kb}
 
+# Per-turn cap on chat-completion rounds. The model gets MAX_TOOL_ROUNDS-1
+# rounds to call read_kb; the final round is forced to text (tool_choice="none"),
+# guaranteeing the loop always terminates with a real answer.
+MAX_TOOL_ROUNDS = 6
+
+USAGE_KEYS = ("prompt", "cached", "completion", "total")
+
+
+def empty_usage() -> dict:
+    return {k: 0 for k in USAGE_KEYS}
+
+
+def add_usage(total: dict, usage: dict) -> None:
+    for k in USAGE_KEYS:
+        total[k] += usage[k]
+
 
 def resolve_tool_calls(messages: list[dict], msg) -> None:
     """Append an assistant turn that requested tools, then each tool result."""
     messages.append(
         {
             "role": "assistant",
-            "content": msg.content or "",
+            # content is None for tool-call-only turns — empty string is rejected
+            # by strict validators (Azure, some proxies) when tool_calls is set.
+            "content": msg.content,
             "tool_calls": [
                 {
                     "id": tc.id,
@@ -88,15 +106,19 @@ def reply(history: list[dict], user_message: str, stream: bool = True) -> tuple[
         *history,
         {"role": "user", "content": user_message},
     ]
-    total = {"prompt": 0, "cached": 0, "completion": 0, "total": 0}
+    total = empty_usage()
 
-    while True:
+    for i in range(MAX_TOOL_ROUNDS):
+        # On the last allowed round, forbid tool calls so the model MUST answer
+        # in text. This guarantees the loop terminates with a real reply rather
+        # than an exception/apology bandaid.
+        kwargs: dict = {"model": MODEL, "messages": messages, "tools": TOOLS}
+        if i == MAX_TOOL_ROUNDS - 1:
+            kwargs["tool_choice"] = "none"
+
         if stream:
             with client.chat.completions.stream(
-                model=MODEL,
-                messages=messages,
-                tools=TOOLS,
-                stream_options={"include_usage": True},
+                **kwargs, stream_options={"include_usage": True}
             ) as s:
                 for event in s:
                     if event.type == "content.delta":
@@ -105,13 +127,10 @@ def reply(history: list[dict], user_message: str, stream: bool = True) -> tuple[
                 final = s.get_final_completion()
             usage = _usage_dict(getattr(final, "usage", None))
         else:
-            final = client.chat.completions.create(
-                model=MODEL, messages=messages, tools=TOOLS
-            )
+            final = client.chat.completions.create(**kwargs)
             usage = _usage_dict(final.usage)
 
-        for key in total:
-            total[key] += usage[key]
+        add_usage(total, usage)
 
         msg = final.choices[0].message
         if msg.tool_calls:
@@ -122,10 +141,14 @@ def reply(history: list[dict], user_message: str, stream: bool = True) -> tuple[
             print()
         return msg.content or "", total
 
+    # Unreachable: the final iteration uses tool_choice="none" so it can't
+    # return tool_calls. Kept as a defensive fallback.
+    return "", total
+
 
 def _usage_dict(usage) -> dict:
     if usage is None:
-        return {"prompt": 0, "cached": 0, "completion": 0, "total": 0}
+        return empty_usage()
     cached = 0
     details = getattr(usage, "prompt_tokens_details", None)
     if details is not None:

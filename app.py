@@ -4,14 +4,19 @@ Run with:
     uv run streamlit run app.py
 """
 
+import sys
+
 import streamlit as st
 
 from assistant import (
+    MAX_TOOL_ROUNDS,
     MODEL,
     SYSTEM_PROMPT,
     TOOLS,
     _usage_dict,
+    add_usage,
     client,
+    empty_usage,
     resolve_tool_calls,
 )
 
@@ -81,34 +86,46 @@ def stream_reply(messages):
     """Yield delta chunks of the final answer; stash summed usage at end.
 
     The model may call read_kb to pull topic files before answering, so this
-    loops over rounds. Tool-call rounds emit no visible text (so nothing is
-    yielded); the final answer streams to the user. Token usage is summed
-    across every round for honest stats.
+    loops over rounds. Deltas stream live for UX; the actual text saved to
+    history is the final non-tool round's `msg.content` (kept separately in
+    `_last_final` to prevent any pre-tool prelude text from polluting history).
+    Token usage is summed across every round.
     """
-    total = {"prompt": 0, "cached": 0, "completion": 0, "total": 0}
-    while True:
-        with client.chat.completions.stream(
-            model=MODEL,
-            messages=messages,
-            tools=TOOLS,
-            stream_options={"include_usage": True},
-        ) as s:
-            for event in s:
-                if event.type == "content.delta":
-                    yield event.delta
-            final = s.get_final_completion()
+    total = empty_usage()
+    st.session_state._last_final = ""
+    try:
+        for i in range(MAX_TOOL_ROUNDS):
+            kwargs: dict = {"model": MODEL, "messages": messages, "tools": TOOLS}
+            if i == MAX_TOOL_ROUNDS - 1:
+                # Final allowed round — forbid tools so the model MUST answer.
+                kwargs["tool_choice"] = "none"
 
-        usage = _usage_dict(getattr(final, "usage", None))
-        for key in total:
-            total[key] += usage[key]
+            with client.chat.completions.stream(
+                **kwargs, stream_options={"include_usage": True}
+            ) as s:
+                for event in s:
+                    if event.type == "content.delta":
+                        yield event.delta
+                final = s.get_final_completion()
 
-        msg = final.choices[0].message
-        if msg.tool_calls:
-            resolve_tool_calls(messages, msg)
-            continue
+            add_usage(total, _usage_dict(getattr(final, "usage", None)))
 
+            msg = final.choices[0].message
+            if msg.tool_calls:
+                resolve_tool_calls(messages, msg)
+                continue
+
+            st.session_state._last_final = msg.content or ""
+            st.session_state._last_usage = total
+            return
+    except Exception as e:
+        # Surface a polite Hebrew apology, keep history consistent. The
+        # exception itself is dropped to stderr by Streamlit's logger.
+        print(f"[stream_reply] {type(e).__name__}: {e}", file=sys.stderr)
+        msg = "מצטערים, אירעה תקלה. אנא נסה/י שוב או בקש/י לעבור לנציג."
+        st.session_state._last_final = msg
         st.session_state._last_usage = total
-        return
+        yield msg
 
 
 for msg in st.session_state.history:
@@ -128,7 +145,10 @@ if user_input := st.chat_input("כתוב הודעה..."):
     with st.chat_message("assistant"):
         full_text = st.write_stream(stream_reply(messages))
 
-    st.session_state.history.append({"role": "assistant", "content": full_text})
+    # Use the final-round msg.content (not the concatenated stream) so any
+    # pre-tool prelude the model may have emitted doesn't pollute history.
+    final_text = st.session_state.pop("_last_final", None) or full_text or ""
+    st.session_state.history.append({"role": "assistant", "content": final_text})
 
     last_usage = st.session_state.get("_last_usage")
     if last_usage:

@@ -18,22 +18,23 @@ Files whose name starts with `_` are kept in the repo for reference but are
 NOT indexed and NOT exposed to the model (internal notes).
 """
 
-import re
+import sys
 from pathlib import Path
 
 KB_DIR = Path(__file__).parent / "knowledge_base"
 
-_NIQQUD = re.compile(r"[֑-ׇ]")  # Hebrew vowel points / cantillation
+_DELIM = "---"
+_DELIM_NL = "\n---\n"  # require newline on both sides so body `---` rules don't truncate
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
     """Return (meta, body). Minimal parser: title/summary strings, keywords list."""
-    if not text.startswith("---"):
+    if not text.startswith(_DELIM):
         return {}, text
-    end = text.find("\n---", 3)
+    end = text.find(_DELIM_NL, len(_DELIM))
     if end == -1:
         return {}, text
-    raw, body = text[3:end], text[end + 4:]
+    raw, body = text[len(_DELIM):end], text[end + len(_DELIM_NL):]
     meta: dict = {}
     for line in raw.splitlines():
         if ":" not in line:
@@ -54,7 +55,12 @@ def _load() -> dict[str, dict]:
     for path in sorted(KB_DIR.glob("*.md")):
         if path.name.startswith("_"):
             continue  # internal notes — not indexed, not exposed
-        meta, body = _parse_frontmatter(path.read_text(encoding="utf-8"))
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as e:
+            print(f"[kb] skipping {path.name}: not valid UTF-8 ({e})", file=sys.stderr)
+            continue
+        meta, body = _parse_frontmatter(text)
         docs[path.name] = {
             "title": meta.get("title", path.stem),
             "keywords": meta.get("keywords", []),
@@ -87,14 +93,13 @@ def build_index() -> str:
 
 def read_kb(filenames: list[str]) -> str:
     """Return the full body of one or more KB files (by filename from the index)."""
-    if isinstance(filenames, str):  # tolerate a single string
-        filenames = [filenames]
+    if not filenames:
+        return "[לא צוין שם קובץ. בחר/י שם קובץ מהאינדקס שבהוראות המערכת.]"
     parts: list[str] = []
     for name in filenames:
-        d = DOCS.get(name) or DOCS.get(name.strip())
+        d = DOCS.get(name.strip())
         if d is None:
-            available = ", ".join(DOCS.keys())
-            parts.append(f"[קובץ לא נמצא: {name}. קבצים זמינים: {available}]")
+            parts.append(f"[קובץ לא נמצא: {name}. בדוק/י שם קובץ באינדקס.]")
         else:
             parts.append(f"# {d['title']} ({name})\n\n{d['body']}")
     return "\n\n---\n\n".join(parts)
