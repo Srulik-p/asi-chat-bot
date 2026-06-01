@@ -44,11 +44,14 @@ st.markdown(
         right: 0;
         left: auto;
     }
-    /* When the sidebar slides out (Streamlit transforms it off-screen),
-       push it to the right edge instead of the left */
+    /* Collapsed: fully hide. translateX alone leaves a narrow strip that
+       renders the sidebar header vertically squeezed under RTL. */
     [data-testid="stSidebar"][aria-expanded="false"] {
         transform: translateX(100%);
         margin-left: 0;
+        visibility: hidden;
+        width: 0;
+        min-width: 0;
     }
 
     /* Mobile: full-height opaque overlay drawer from the right */
