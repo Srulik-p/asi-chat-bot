@@ -37,40 +37,29 @@ st.markdown(
     [data-testid="stChatInput"] textarea { direction: rtl; text-align: right; }
     [data-testid="stHeader"] { direction: ltr; }
 
-    /* Sidebar - anchor to the right side of the screen for RTL */
+    /* Sidebar — fixed overlay anchored to the right (works for RTL on
+       both desktop and mobile). Without position:fixed, the right:0
+       anchor is ignored and Streamlit's collapse leaves a squeezed strip. */
     [data-testid="stSidebar"] {
         direction: rtl;
         text-align: right;
+        position: fixed;
+        top: 0;
         right: 0;
         left: auto;
+        height: 100vh;
+        width: 320px;
+        max-width: min(85vw, 340px);
+        background-color: var(--background-color, #0e1117);
+        box-shadow: -2px 0 10px rgba(0, 0, 0, 0.3);
+        z-index: 999;
+        transition: transform 0.3s ease;
     }
-    /* Collapsed: fully hide. translateX alone leaves a narrow strip that
-       renders the sidebar header vertically squeezed under RTL. */
-    [data-testid="stSidebar"][aria-expanded="false"] {
-        transform: translateX(100%);
-        margin-left: 0;
-        visibility: hidden;
-        width: 0;
-        min-width: 0;
-    }
+    [data-testid="stSidebar"][aria-expanded="false"] { transform: translateX(100%); }
+    [data-testid="stSidebar"][aria-expanded="true"]  { transform: translateX(0); }
 
-    /* Mobile: full-height opaque overlay drawer from the right */
-    @media (max-width: 768px) {
-        [data-testid="stSidebar"] {
-            position: fixed;
-            top: 0;
-            right: 0;
-            left: auto;
-            height: 100vh;
-            width: 85vw;
-            max-width: 340px;
-            background-color: var(--background-color, #0e1117);
-            box-shadow: -2px 0 10px rgba(0, 0, 0, 0.4);
-            z-index: 999;
-        }
-        /* Ensure main content fills the screen instead of leaving sidebar gutter */
-        section[data-testid="stMain"] { padding-right: 0; }
-    }
+    /* Main content fills full viewport — sidebar overlays, doesn't push. */
+    section[data-testid="stMain"] { padding-right: 0; }
     </style>
     """,
     unsafe_allow_html=True,
