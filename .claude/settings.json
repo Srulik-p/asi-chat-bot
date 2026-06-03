@@ -1,6 +1,13 @@
 {
   "permissions": {
     "deny": ["Read(.env)", "Read(.env.*)", "Edit(.env)", "Edit(.env.*)"],
-    "allow": ["Read(.env.example)", "Read(.env.*.example)"]
+    "allow": [
+      "Read(.env.example)",
+      "Read(.env.*.example)",
+      "Edit(.env.example)",
+      "Edit(.env.*.example)",
+      "Write(.env.example)",
+      "Write(.env.*.example)"
+    ]
   }
 }

@@ -22,3 +22,9 @@ venv/
 raw dada/
 cleaned/
 cleaned_data/
+
+# Local SQLite store (contains user PII — phone numbers, tokens)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

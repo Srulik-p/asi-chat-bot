@@ -15,6 +15,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -46,6 +47,35 @@ TOOL_FNS = {"read_kb": kb.read_kb}
 MAX_TOOL_ROUNDS = 6
 
 USAGE_KEYS = ("prompt", "cached", "completion", "total")
+
+# PII scrubbing: applied only to user-role content before sending to the model.
+# History keeps the raw values so a human rep can read them after escalation.
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+?972[-\s.]?|0)\d{1,2}[-\s.]?\d{3}[-\s.]?\d{4}(?!\d)"
+)
+_ID_RE = re.compile(r"(?<!\d)\d{9}(?!\d)")
+
+
+def redact_pii(text: str) -> str:
+    """Replace emails, Israeli phone numbers, and 9-digit IDs with Hebrew placeholders."""
+    if not text:
+        return text
+    text = _EMAIL_RE.sub("[מייל]", text)
+    text = _PHONE_RE.sub("[טלפון]", text)
+    text = _ID_RE.sub("[תעודת זהות]", text)
+    return text
+
+
+def scrub_messages(messages: list[dict]) -> list[dict]:
+    """Return a new list with PII redacted from user-role text content."""
+    out: list[dict] = []
+    for m in messages:
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            out.append({**m, "content": redact_pii(m["content"])})
+        else:
+            out.append(m)
+    return out
 
 
 def empty_usage() -> dict:
@@ -106,6 +136,7 @@ def reply(history: list[dict], user_message: str, stream: bool = True) -> tuple[
         *history,
         {"role": "user", "content": user_message},
     ]
+    messages = scrub_messages(messages)
     total = empty_usage()
 
     for i in range(MAX_TOOL_ROUNDS):

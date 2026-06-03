@@ -18,6 +18,7 @@ from assistant import (
     client,
     empty_usage,
     resolve_tool_calls,
+    scrub_messages,
 )
 
 
@@ -83,6 +84,7 @@ def stream_reply(messages):
     `_last_final` to prevent any pre-tool prelude text from polluting history).
     Token usage is summed across every round.
     """
+    messages = scrub_messages(messages)
     total = empty_usage()
     st.session_state._last_final = ""
     try:
