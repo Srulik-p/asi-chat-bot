@@ -1,35 +1,68 @@
-"""HTTP server for the auth callback (and future webhooks).
+"""HTTP backend: chat processing + auth callback.
 
 Run with:
     uv run uvicorn server:app --reload --port 8000
 
-Streamlit (app.py) is the chat UI; this is the backend the external login
-flow calls into. They deploy as separate services.
+Endpoints
+---------
+POST /chat/message
+    Headers: X-Internal-Secret: <INTERNAL_API_SECRET>
+    Body:    { phoneNumber, message }
+    Returns: streaming NDJSON
+               {"type":"delta","text":"..."}    (zero or more, only on final round)
+               {"type":"done","usage":{...}}    (exactly one, at end)
+               {"type":"error","message":"..."}  (instead of done on failure)
+    Persists the user turn, runs the OpenAI tool-call loop (including read_kb),
+    persists every assistant/tool turn, and streams the final reply.
 
-Endpoint:
-    POST /auth/callback
-        Headers: X-Webhook-Secret: <shared secret, env AUTH_CALLBACK_SECRET>
-        Body:    { phoneNumber, user: { id, firstName, lastName }, accessToken }
-        Effect:  upsert into the users table keyed by phoneNumber.
-        Returns: 204 No Content on success.
+GET  /chat/history?phoneNumber=...
+    Headers: X-Internal-Secret
+    Returns: {"messages":[{role,content,...}, ...]}
+
+POST /chat/reset
+    Headers: X-Internal-Secret
+    Body:    { phoneNumber }
+    Returns: {"deleted": n}
+
+POST /auth/callback
+    Headers: X-Webhook-Secret: <AUTH_CALLBACK_SECRET>
+    Body:    { phoneNumber, user:{id,firstName,lastName}, accessToken }
+    Effect:  upsert users row by phoneNumber.
+
+GET  /healthz
 """
 
 from __future__ import annotations
 
 import hmac
+import json
 import os
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, AsyncIterator, Iterator
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, Header, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import db
+from assistant import (
+    MAX_TOOL_ROUNDS,
+    MODEL,
+    SYSTEM_PROMPT,
+    TOOL_FNS,
+    TOOLS,
+    _usage_dict,
+    add_usage,
+    client,
+    empty_usage,
+    scrub_messages,
+)
 
 load_dotenv()
 
 WEBHOOK_SECRET = os.getenv("AUTH_CALLBACK_SECRET", "")
+INTERNAL_SECRET = os.getenv("INTERNAL_API_SECRET", "")
 
 
 @asynccontextmanager
@@ -40,6 +73,20 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Sugar Daddy assistant — backend", lifespan=lifespan)
 
+
+# ---------- shared auth helpers ----------
+
+def _check_secret(provided: str | None, expected: str, name: str) -> None:
+    if not expected:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"server misconfigured: {name} is not set",
+        )
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=f"invalid {name}")
+
+
+# ---------- /auth/callback ----------
 
 class AuthUser(BaseModel):
     id: str
@@ -53,24 +100,12 @@ class AuthCallback(BaseModel):
     accessToken: str
 
 
-def _check_secret(provided: str | None) -> None:
-    # Refuse if the server has no secret configured — better to 503 than
-    # to silently accept anonymous writes to the users table.
-    if not WEBHOOK_SECRET:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="server misconfigured: AUTH_CALLBACK_SECRET is not set",
-        )
-    if not provided or not hmac.compare_digest(provided, WEBHOOK_SECRET):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="invalid webhook secret")
-
-
 @app.post("/auth/callback", status_code=status.HTTP_204_NO_CONTENT)
 def auth_callback(
     payload: AuthCallback,
     x_webhook_secret: Annotated[str | None, Header(alias="X-Webhook-Secret")] = None,
 ) -> None:
-    _check_secret(x_webhook_secret)
+    _check_secret(x_webhook_secret, WEBHOOK_SECRET, "AUTH_CALLBACK_SECRET")
     db.upsert_user(
         phone_number=payload.phoneNumber,
         external_id=payload.user.id,
@@ -79,6 +114,127 @@ def auth_callback(
         access_token=payload.accessToken,
     )
 
+
+# ---------- /chat ----------
+
+class ChatMessageIn(BaseModel):
+    phoneNumber: str
+    message: str
+
+
+class ChatResetIn(BaseModel):
+    phoneNumber: str
+
+
+def _run_chat(phone: str, user_message: str) -> Iterator[dict]:
+    """Generator that drives the OpenAI tool-call loop and yields NDJSON events.
+
+    All conversation state lives in the DB. We persist every turn (user,
+    assistant tool-calls, tool results, final assistant reply) so the
+    next call can rebuild history from scratch.
+    """
+    db.append_message(phone, "user", content=user_message)
+
+    # Build the LLM-facing messages list. scrub_messages redacts emails/phones/IDs
+    # from user-role content only; the stored DB rows keep the raw values for
+    # human-rep visibility.
+    history = db.load_history(phone)
+    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+    messages = scrub_messages(messages)
+
+    total = empty_usage()
+
+    try:
+        for i in range(MAX_TOOL_ROUNDS):
+            kwargs: dict = {"model": MODEL, "messages": messages, "tools": TOOLS}
+            if i == MAX_TOOL_ROUNDS - 1:
+                kwargs["tool_choice"] = "none"
+
+            with client.chat.completions.stream(
+                **kwargs, stream_options={"include_usage": True}
+            ) as s:
+                for event in s:
+                    if event.type == "content.delta":
+                        yield {"type": "delta", "text": event.delta}
+                final = s.get_final_completion()
+
+            add_usage(total, _usage_dict(getattr(final, "usage", None)))
+            msg = final.choices[0].message
+
+            if msg.tool_calls:
+                tc_payload = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ]
+                db.append_message(phone, "assistant", content=msg.content, tool_calls=tc_payload)
+                messages.append({"role": "assistant", "content": msg.content, "tool_calls": tc_payload})
+
+                for tc in msg.tool_calls:
+                    fn = TOOL_FNS.get(tc.function.name)
+                    if fn is None:
+                        result = f"כלי לא ידוע: {tc.function.name}"
+                    else:
+                        try:
+                            args = json.loads(tc.function.arguments or "{}")
+                            result = fn(**args)
+                        except (json.JSONDecodeError, TypeError) as e:
+                            result = f"שגיאה בהפעלת הכלי {tc.function.name}: {e}"
+                    db.append_message(phone, "tool", tool_call_id=tc.id, content=result)
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                continue
+
+            text = msg.content or ""
+            db.append_message(phone, "assistant", content=text)
+            yield {"type": "done", "usage": total}
+            return
+    except Exception as e:
+        # Stream a structured error so the client can render a polite message.
+        yield {"type": "error", "message": f"{type(e).__name__}: {e}"}
+
+
+def _ndjson(events: Iterator[dict]) -> Iterator[bytes]:
+    for ev in events:
+        yield (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+@app.post("/chat/message")
+def chat_message(
+    payload: ChatMessageIn,
+    x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
+) -> StreamingResponse:
+    _check_secret(x_internal_secret, INTERNAL_SECRET, "INTERNAL_API_SECRET")
+    return StreamingResponse(
+        _ndjson(_run_chat(payload.phoneNumber, payload.message)),
+        media_type="application/x-ndjson",
+    )
+
+
+@app.get("/chat/history")
+def chat_history(
+    phoneNumber: Annotated[str, Query(min_length=1)],
+    x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
+) -> dict:
+    _check_secret(x_internal_secret, INTERNAL_SECRET, "INTERNAL_API_SECRET")
+    return {"messages": db.load_history(phoneNumber)}
+
+
+@app.post("/chat/reset")
+def chat_reset(
+    payload: ChatResetIn,
+    x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
+) -> dict:
+    _check_secret(x_internal_secret, INTERNAL_SECRET, "INTERNAL_API_SECRET")
+    return {"deleted": db.clear_history(payload.phoneNumber)}
+
+
+# ---------- health ----------
 
 @app.get("/healthz")
 def healthz() -> dict:

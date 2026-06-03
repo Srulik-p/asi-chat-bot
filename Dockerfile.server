@@ -9,8 +9,9 @@ COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
 
-# API server + DB layer. No need for the chat UI or KB files here.
-COPY server.py db.py ./
+# API server runs the LLM, so it needs the assistant module, KB, and prompt.
+COPY server.py db.py assistant.py kb.py system_prompt.md ./
+COPY knowledge_base/ ./knowledge_base/
 
 ENV PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH"

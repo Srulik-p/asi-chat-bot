@@ -9,9 +9,8 @@ COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
 
-# App code.
-COPY app.py assistant.py kb.py system_prompt.md ./
-COPY knowledge_base/ ./knowledge_base/
+# Thin UI client — talks to the backend over HTTP, no LLM/KB in this image.
+COPY app.py ./
 
 ENV PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH"

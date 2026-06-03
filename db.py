@@ -16,12 +16,16 @@ from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import (
+    JSON,
     Column,
     DateTime,
+    Integer,
     MetaData,
     String,
     Table,
+    Text,
     create_engine,
+    delete,
     select,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -66,6 +70,21 @@ users_table = Table(
     Column("access_token", String, nullable=False),
     Column("created_at", DateTime, nullable=False),
     Column("updated_at", DateTime, nullable=False),
+)
+
+# Per-conversation log. Keyed by phone_number — a row exists whether or not
+# the user has signed in (the users row only appears after auth callback).
+# Tool-call rounds are stored too so the OpenAI tool-call loop can be replayed.
+messages_table = Table(
+    "messages",
+    _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("phone_number", String, nullable=False, index=True),
+    Column("role", String, nullable=False),  # user | assistant | tool | system
+    Column("content", Text),                  # may be None for tool-call-only assistant turns
+    Column("tool_calls", JSON),               # list[dict] when present
+    Column("tool_call_id", String),           # set for role=tool
+    Column("created_at", DateTime, nullable=False),
 )
 
 
@@ -113,3 +132,50 @@ def get_user_by_phone(phone_number: str) -> Optional[dict]:
             select(users_table).where(users_table.c.phone_number == phone_number)
         ).mappings().first()
         return dict(row) if row else None
+
+
+def append_message(
+    phone_number: str,
+    role: str,
+    content: Optional[str] = None,
+    tool_calls: Optional[list] = None,
+    tool_call_id: Optional[str] = None,
+) -> None:
+    with _engine.begin() as conn:
+        conn.execute(
+            messages_table.insert().values(
+                phone_number=phone_number,
+                role=role,
+                content=content,
+                tool_calls=tool_calls,
+                tool_call_id=tool_call_id,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+
+
+def load_history(phone_number: str) -> list[dict]:
+    """Return messages for `phone_number` in OpenAI chat-completion shape."""
+    with _engine.connect() as conn:
+        rows = conn.execute(
+            select(messages_table)
+            .where(messages_table.c.phone_number == phone_number)
+            .order_by(messages_table.c.id)
+        ).mappings().all()
+    out: list[dict] = []
+    for r in rows:
+        m: dict = {"role": r["role"], "content": r["content"]}
+        if r["tool_calls"]:
+            m["tool_calls"] = r["tool_calls"]
+        if r["tool_call_id"]:
+            m["tool_call_id"] = r["tool_call_id"]
+        out.append(m)
+    return out
+
+
+def clear_history(phone_number: str) -> int:
+    with _engine.begin() as conn:
+        result = conn.execute(
+            delete(messages_table).where(messages_table.c.phone_number == phone_number)
+        )
+        return result.rowcount or 0
