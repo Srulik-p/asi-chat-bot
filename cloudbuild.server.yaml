@@ -5,9 +5,9 @@ steps:
       - -f
       - Dockerfile.server
       - -t
-      - europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/asi-chat-bot-api:$BUILD_ID
+      - europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/asi-chat-bot-api:latest
       - .
 images:
-  - europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/asi-chat-bot-api:$BUILD_ID
+  - europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/asi-chat-bot-api:latest
 options:
   logging: CLOUD_LOGGING_ONLY
