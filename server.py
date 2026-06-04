@@ -141,10 +141,16 @@ def _check_secret(provided: str | None, expected: str, name: str) -> None:
 
 # ---------- /auth/callback ----------
 
+class UserLabel(BaseModel):
+    id: str
+    name: str
+
+
 class AuthUser(BaseModel):
     id: str
-    firstName: str
-    lastName: str
+    nickname: str
+    isPremium: bool
+    labels: list[UserLabel]
 
 
 class AuthCallback(BaseModel):
@@ -162,8 +168,9 @@ def auth_callback(
     db.upsert_user(
         phone_number=payload.phoneNumber,
         external_id=payload.user.id,
-        first_name=payload.user.firstName,
-        last_name=payload.user.lastName,
+        nickname=payload.user.nickname,
+        is_premium=payload.user.isPremium,
+        labels=[l.model_dump() for l in payload.user.labels],
         access_token=payload.accessToken,
     )
 

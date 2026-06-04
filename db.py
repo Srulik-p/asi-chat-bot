@@ -17,6 +17,7 @@ from typing import Optional
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     Column,
     DateTime,
     Integer,
@@ -64,9 +65,10 @@ users_table = Table(
     "users",
     _metadata,
     Column("phone_number", String, primary_key=True),
-    Column("external_id", String, nullable=False),
-    Column("first_name", String),
-    Column("last_name", String),
+    Column("external_id", String, nullable=False),    # payload.user.id
+    Column("nickname", String),                        # payload.user.nickname
+    Column("is_premium", Boolean, nullable=False),     # payload.user.isPremium
+    Column("labels", JSON),                            # payload.user.labels — list[{id,name}]
     Column("access_token", String, nullable=False),
     Column("created_at", DateTime, nullable=False),
     Column("updated_at", DateTime, nullable=False),
@@ -95,8 +97,9 @@ def init_db() -> None:
 def upsert_user(
     phone_number: str,
     external_id: str,
-    first_name: str,
-    last_name: str,
+    nickname: Optional[str],
+    is_premium: bool,
+    labels: list[dict],
     access_token: str,
 ) -> None:
     # Timestamps set in Python so the INSERT always supplies them, regardless
@@ -106,8 +109,9 @@ def upsert_user(
     stmt = insert(users_table).values(
         phone_number=phone_number,
         external_id=external_id,
-        first_name=first_name,
-        last_name=last_name,
+        nickname=nickname,
+        is_premium=is_premium,
+        labels=labels,
         access_token=access_token,
         created_at=now,
         updated_at=now,
@@ -116,8 +120,9 @@ def upsert_user(
         index_elements=[users_table.c.phone_number],
         set_={
             "external_id": stmt.excluded.external_id,
-            "first_name": stmt.excluded.first_name,
-            "last_name": stmt.excluded.last_name,
+            "nickname": stmt.excluded.nickname,
+            "is_premium": stmt.excluded.is_premium,
+            "labels": stmt.excluded.labels,
             "access_token": stmt.excluded.access_token,
             "updated_at": stmt.excluded.updated_at,
         },
