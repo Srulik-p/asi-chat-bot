@@ -37,12 +37,14 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import sys
 from contextlib import asynccontextmanager
 from typing import Annotated, AsyncIterator, Iterator
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Query, status
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 import db
@@ -72,6 +74,57 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Sugar Daddy assistant — backend", lifespan=lifespan)
+
+
+_SENSITIVE_KEY_FRAGMENTS = (
+    "token",
+    "secret",
+    "password",
+    "pwd",
+    "authorization",
+    "apikey",
+    "api_key",
+)
+
+
+def _redact(obj):
+    """Recursively replace values of known-sensitive keys with a sentinel.
+
+    Preserves structure and non-sensitive values so logs stay diagnostic.
+    Long strings are truncated to keep log volume bounded.
+    """
+    if isinstance(obj, dict):
+        return {
+            k: ("<redacted>" if any(f in k.lower() for f in _SENSITIVE_KEY_FRAGMENTS) else _redact(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_redact(v) for v in obj]
+    if isinstance(obj, str) and len(obj) > 500:
+        return obj[:500] + f"…<truncated, {len(obj)} chars>"
+    return obj
+
+
+@app.exception_handler(RequestValidationError)
+async def _log_validation_error(request: Request, exc: RequestValidationError):
+    # /auth/callback carries accessToken; /chat/message carries free-text user
+    # input. The payload is logged with values of known-sensitive keys masked
+    # (token/secret/password/authorization/apiKey) so we can diagnose contract
+    # mismatches without writing raw secrets to Cloud Logging.
+    safe_errors = [
+        {"loc": e.get("loc"), "msg": e.get("msg"), "type": e.get("type")}
+        for e in exc.errors()
+    ]
+    try:
+        parsed = json.loads(await request.body())
+        payload_repr = _redact(parsed)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload_repr = "<unparseable>"
+    print(
+        f"[422] {request.method} {request.url.path} payload={payload_repr} errors={safe_errors}",
+        file=sys.stderr,
+    )
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
 
 
 # ---------- shared auth helpers ----------
