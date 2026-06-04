@@ -91,7 +91,22 @@ messages_table = Table(
 
 
 def init_db() -> None:
-    _metadata.create_all(_engine)
+    """Bring the DB schema up to the latest Alembic revision.
+
+    Runs `alembic upgrade head` against the same engine the app uses. Safe
+    to run on every startup: Alembic uses the alembic_version table to
+    skip migrations that have already been applied.
+    """
+    # Imported here to avoid a hard dependency at module load — db.py is also
+    # used by Alembic env.py, and Alembic imports db at its own startup time.
+    from alembic import command
+    from alembic.config import Config
+    from pathlib import Path
+
+    cfg = Config(str(Path(__file__).parent / "alembic.ini"))
+    cfg.set_main_option("script_location", str(Path(__file__).parent / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", _URL)
+    command.upgrade(cfg, "head")
 
 
 def upsert_user(
