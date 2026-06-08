@@ -26,8 +26,9 @@ POST /chat/reset
 
 POST /auth/callback
     Headers: X-Webhook-Secret: <AUTH_CALLBACK_SECRET>
-    Body:    { phoneNumber, user:{id,firstName,lastName}, accessToken }
-    Effect:  upsert users row by phoneNumber.
+    Body:    { phoneNumber, user:{id,nickname,isPremium,labels:[{id,name}]}, accessToken }
+    Effect:  upsert users row by phoneNumber, then push a "connected" message
+             to the user via the outbound sender (best-effort, in background).
 
 GET  /healthz
 """
@@ -40,14 +41,16 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from typing import Annotated, AsyncIterator, Iterator
+from urllib.parse import quote
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 import db
+import notifier
 from assistant import (
     MAX_TOOL_ROUNDS,
     MODEL,
@@ -65,6 +68,8 @@ load_dotenv()
 
 WEBHOOK_SECRET = os.getenv("AUTH_CALLBACK_SECRET", "")
 INTERNAL_SECRET = os.getenv("INTERNAL_API_SECRET", "")
+# Base of the external sign-in URL; the user's phone is appended as a query arg.
+LOGIN_URL_BASE = os.getenv("LOGIN_URL_BASE", "https://qa.sugardaddy.cy/sign-in")
 
 
 @asynccontextmanager
@@ -159,9 +164,26 @@ class AuthCallback(BaseModel):
     accessToken: str
 
 
+def _connected_message(nickname: str | None) -> str:
+    """The 'I see you connected' greeting pushed right after a successful login."""
+    hi = f"היי {nickname}, " if nickname else "היי, "
+    return (
+        hi
+        + "אני רואה שהתחברת בהצלחה 🙂 עכשיו אני יכולה לראות את הסטטוס שלך "
+        + "ולעזור לך עם כל מה שקשור לחשבון. במה אפשר לעזור?"
+    )
+
+
+def _notify_connected(phone: str, message: str) -> None:
+    """Push the connected greeting and, on success, record it in the chat history."""
+    if notifier.send_message(phone, message):
+        db.append_message(phone, "assistant", content=message)
+
+
 @app.post("/auth/callback", status_code=status.HTTP_204_NO_CONTENT)
 def auth_callback(
     payload: AuthCallback,
+    background_tasks: BackgroundTasks,
     x_webhook_secret: Annotated[str | None, Header(alias="X-Webhook-Secret")] = None,
 ) -> None:
     _check_secret(x_webhook_secret, WEBHOOK_SECRET, "AUTH_CALLBACK_SECRET")
@@ -172,6 +194,11 @@ def auth_callback(
         is_premium=payload.user.isPremium,
         labels=[l.model_dump() for l in payload.user.labels],
         access_token=payload.accessToken,
+    )
+    # Push "I see you connected" out-of-band so the callback returns 204 fast and
+    # the (best-effort) send can't block or fail the auth flow.
+    background_tasks.add_task(
+        _notify_connected, payload.phoneNumber, _connected_message(payload.user.nickname)
     )
 
 
@@ -184,6 +211,62 @@ class ChatMessageIn(BaseModel):
 
 class ChatResetIn(BaseModel):
     phoneNumber: str
+
+
+# ---------- account-status tool ----------
+# Defined here (not in assistant.py) because it needs the conversation's phone
+# number and the DB — the phone is deliberately kept out of the model, so the
+# model calls this tool and the backend resolves it from the conversation
+# identity. Returns either the membership status (if logged in) or a login URL
+# for the bot to send (if not).
+
+ACCOUNT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_account_status",
+            "description": (
+                "Get the current customer's login and membership status. Call this "
+                "for any question that depends on the customer's OWN account state "
+                "(e.g. 'do I have a subscription?', 'am I premium?', 'what's my "
+                "status?'). Returns logged_in plus, if logged in, the membership "
+                "details (nickname, is_premium, labels); if not logged in, a "
+                "login_url to send the customer so they can sign in. Takes no "
+                "arguments — the customer is identified by the conversation."
+            ),
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    }
+]
+
+TOOLS_ALL = TOOLS + ACCOUNT_TOOLS
+
+
+def _account_status_for(phone: str) -> str:
+    """Resolve get_account_status for `phone`. Returns a JSON string (tool result)."""
+    user = db.get_user_by_phone(phone)
+    if user is None:
+        login_url = f"{LOGIN_URL_BASE}?phoneNumber={quote(phone, safe='')}"
+        return json.dumps(
+            {
+                "logged_in": False,
+                "login_url": login_url,
+                "instructions": (
+                    "הלקוח לא מחובר. בקש/י ממנו להתחבר דרך login_url כדי שתוכל/י "
+                    "לראות את הסטטוס שלו, ושלח/י לו את הקישור כפי שהוא."
+                ),
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "logged_in": True,
+            "nickname": user["nickname"],
+            "is_premium": user["is_premium"],
+            "labels": user["labels"],
+        },
+        ensure_ascii=False,
+    )
 
 
 def _run_chat(phone: str, user_message: str) -> Iterator[dict]:
@@ -206,7 +289,7 @@ def _run_chat(phone: str, user_message: str) -> Iterator[dict]:
 
     try:
         for i in range(MAX_TOOL_ROUNDS):
-            kwargs: dict = {"model": MODEL, "messages": messages, "tools": TOOLS}
+            kwargs: dict = {"model": MODEL, "messages": messages, "tools": TOOLS_ALL}
             if i == MAX_TOOL_ROUNDS - 1:
                 kwargs["tool_choice"] = "none"
 
@@ -237,15 +320,20 @@ def _run_chat(phone: str, user_message: str) -> Iterator[dict]:
                 messages.append({"role": "assistant", "content": msg.content, "tool_calls": tc_payload})
 
                 for tc in msg.tool_calls:
-                    fn = TOOL_FNS.get(tc.function.name)
-                    if fn is None:
-                        result = f"כלי לא ידוע: {tc.function.name}"
+                    name = tc.function.name
+                    if name == "get_account_status":
+                        # Resolved from the conversation identity + DB, not the model args.
+                        result = _account_status_for(phone)
                     else:
-                        try:
-                            args = json.loads(tc.function.arguments or "{}")
-                            result = fn(**args)
-                        except (json.JSONDecodeError, TypeError) as e:
-                            result = f"שגיאה בהפעלת הכלי {tc.function.name}: {e}"
+                        fn = TOOL_FNS.get(name)
+                        if fn is None:
+                            result = f"כלי לא ידוע: {name}"
+                        else:
+                            try:
+                                args = json.loads(tc.function.arguments or "{}")
+                                result = fn(**args)
+                            except (json.JSONDecodeError, TypeError) as e:
+                                result = f"שגיאה בהפעלת הכלי {name}: {e}"
                     db.append_message(phone, "tool", tool_call_id=tc.id, content=result)
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
                 continue

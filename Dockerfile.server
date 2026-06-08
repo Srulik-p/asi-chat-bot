@@ -10,7 +10,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
 
 # API server runs the LLM, so it needs the assistant module, KB, and prompt.
-COPY server.py db.py assistant.py kb.py system_prompt.md alembic.ini ./
+COPY server.py db.py assistant.py notifier.py kb.py system_prompt.md alembic.ini ./
 COPY knowledge_base/ ./knowledge_base/
 COPY alembic/ ./alembic/
 
