@@ -99,14 +99,43 @@ def init_db() -> None:
     """
     # Imported here to avoid a hard dependency at module load — db.py is also
     # used by Alembic env.py, and Alembic imports db at its own startup time.
+    import sys
+    import traceback
     from alembic import command
     from alembic.config import Config
     from pathlib import Path
+    from sqlalchemy import inspect, text
+
+    # One-time Alembic adoption. The original schema was created ad-hoc
+    # (pre-Alembic) and predates the nickname/is_premium/labels columns, so it
+    # has no alembic_version table. Migration 0001 would then hit "relation
+    # users already exists" and crash startup. Detect that exact state and drop
+    # the legacy tables so 0001 can recreate them cleanly. Guarded on the
+    # absence of alembic_version, so it runs at most once and never touches a
+    # DB that Alembic already manages.
+    with _engine.begin() as conn:
+        tables = set(inspect(conn).get_table_names())
+        if "alembic_version" not in tables and (tables & {"users", "messages"}):
+            print(
+                "[init_db] legacy pre-Alembic schema detected; dropping users/messages "
+                "so migration 0001 can recreate them",
+                file=sys.stderr,
+            )
+            cascade = " CASCADE" if _IS_POSTGRES else ""
+            conn.execute(text(f"DROP TABLE IF EXISTS messages{cascade}"))
+            conn.execute(text(f"DROP TABLE IF EXISTS users{cascade}"))
 
     cfg = Config(str(Path(__file__).parent / "alembic.ini"))
     cfg.set_main_option("script_location", str(Path(__file__).parent / "alembic"))
     cfg.set_main_option("sqlalchemy.url", _URL)
-    command.upgrade(cfg, "head")
+    try:
+        command.upgrade(cfg, "head")
+    except Exception:
+        # Surface the real traceback in Cloud Run logs — a bare migration
+        # failure here otherwise only shows up as "container failed to listen".
+        print("[init_db] alembic upgrade failed:", file=sys.stderr)
+        traceback.print_exc()
+        raise
 
 
 def upsert_user(
