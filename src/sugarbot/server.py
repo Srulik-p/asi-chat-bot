@@ -1,7 +1,7 @@
 """HTTP backend: chat processing + auth callback.
 
 Run with:
-    uv run uvicorn server:app --reload --port 8000
+    uv run uvicorn sugarbot.server:app --reload --port 8000
 
 Endpoints
 ---------
@@ -49,9 +49,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-import db
-import notifier
-from assistant import (
+from sugarbot import db, notifier
+from sugarbot.assistant import (
     MAX_TOOL_ROUNDS,
     MODEL,
     SYSTEM_PROMPT,

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from alembic import context
 
-import db
+from sugarbot import db
 
 config = context.config
 target_metadata = db._metadata

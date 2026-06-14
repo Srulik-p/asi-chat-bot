@@ -9,15 +9,18 @@ __pycache__/
 .env.*
 !.env.example
 
+# Local SQLite store (user PII — phone numbers, tokens)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Project data (large + PII risk)
-raw dada/
-cleaned/
-cleaned_data/
+data/
 
 # Dev-only files not needed at runtime
-clean_chats.py
-qa_patterns.md
-requirements.txt
+scripts/
+tests/
 
 # Build / OS / editor
 .DS_Store
@@ -29,4 +32,6 @@ requirements.txt
 
 # Docker itself
 Dockerfile
+Dockerfile.server
 .dockerignore
+cloudbuild.server.yaml

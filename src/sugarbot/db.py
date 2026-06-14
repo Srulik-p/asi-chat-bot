@@ -125,8 +125,10 @@ def init_db() -> None:
             conn.execute(text(f"DROP TABLE IF EXISTS messages{cascade}"))
             conn.execute(text(f"DROP TABLE IF EXISTS users{cascade}"))
 
-    cfg = Config(str(Path(__file__).parent / "alembic.ini"))
-    cfg.set_main_option("script_location", str(Path(__file__).parent / "alembic"))
+    # File-less Config: migrations ship inside the package, so the runtime
+    # never depends on alembic.ini (that file is for the dev CLI only).
+    cfg = Config()
+    cfg.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
     cfg.set_main_option("sqlalchemy.url", _URL)
     try:
         command.upgrade(cfg, "head")

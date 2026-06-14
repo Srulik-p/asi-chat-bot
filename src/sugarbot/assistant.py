@@ -22,7 +22,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-import kb
+from sugarbot import kb
 
 
 load_dotenv()

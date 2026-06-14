@@ -19,9 +19,7 @@ venv/
 .idea/
 
 # Project data — chat exports may contain residual PII
-raw dada/
-cleaned/
-cleaned_data/
+data/
 
 # Local SQLite store (contains user PII — phone numbers, tokens)
 *.db

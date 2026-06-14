@@ -1,7 +1,7 @@
 """Streamlit chat UI — thin client of the backend chat API.
 
 Run with:
-    uv run streamlit run app.py
+    uv run streamlit run ui/app.py
 
 All LLM work happens in server.py (FastAPI). This file only renders the
 chat surface and talks to the backend via HTTP. The phone-number input

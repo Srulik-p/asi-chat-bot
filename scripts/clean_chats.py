@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Strip private details (phone numbers, emails) from WhatsApp chat exports.
 
-Reads every *.txt in `raw dada/` and writes a sanitized copy into `cleaned/`:
+Reads every *.txt in `data/raw/` and writes a sanitized copy into `data/cleaned/`:
 - Phone numbers (any format) -> last 5 digits.
 - Emails -> ***EMAIL***.
 - Filenames are sanitized too.
@@ -39,9 +39,9 @@ def clean(text: str) -> str:
 
 
 def main() -> int:
-    root = Path(__file__).parent
-    src = root / "raw dada"
-    dst = root / "cleaned"
+    root = Path(__file__).resolve().parents[1]
+    src = root / "data" / "raw"
+    dst = root / "data" / "cleaned"
 
     if not src.is_dir():
         print(f"source folder not found: {src}", file=sys.stderr)
