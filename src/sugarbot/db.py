@@ -57,6 +57,12 @@ _engine = create_engine(
     pool_pre_ping=_IS_POSTGRES,  # cheap NOOP for sqlite
     pool_size=5 if _IS_POSTGRES else 0,
     max_overflow=5 if _IS_POSTGRES else 0,
+    # Pin the Postgres session to UTC. updated_at/created_at are naive
+    # TIMESTAMP columns written as datetime.now(timezone.utc); a non-UTC server
+    # timezone would shift their wall-clock and skew the freshness math in
+    # server._login_is_stale (which reads them back as UTC). SQLite has no
+    # session timezone and already round-trips the UTC value we wrote.
+    connect_args={"options": "-c timezone=utc"} if _IS_POSTGRES else {},
 )
 
 _metadata = MetaData()

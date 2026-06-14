@@ -81,4 +81,19 @@ st = json.loads(server._account_status_for(phone))
 assert st["is_premium"] is False and st["labels"] == [{"id": "l3", "name": "expired"}], st
 print("5. re-login upsert -> status/labels updated")
 
+# 6) Stale login (>72h since last login) -> treated as logged_in false + stale flag
+import datetime as _dt  # noqa: E402
+
+stale_ts = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=server.ACCOUNT_FRESHNESS_HOURS + 1)
+with db._engine.begin() as conn:
+    conn.execute(
+        db.users_table.update()
+        .where(db.users_table.c.phone_number == phone)
+        .values(updated_at=stale_ts)
+    )
+st = json.loads(server._account_status_for(phone))
+assert st["logged_in"] is False and st.get("stale") is True, st
+assert st["login_url"].startswith("https://qa.sugardaddy.cy/sign-in?phoneNumber="), st
+print("6. stale login (>72h) -> logged_in=false, stale=true")
+
 print("\nALL CHECKS PASSED")

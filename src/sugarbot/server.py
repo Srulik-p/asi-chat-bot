@@ -40,6 +40,7 @@ import json
 import os
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Annotated, AsyncIterator, Iterator
 from urllib.parse import quote
 
@@ -69,6 +70,9 @@ WEBHOOK_SECRET = os.getenv("AUTH_CALLBACK_SECRET", "")
 INTERNAL_SECRET = os.getenv("INTERNAL_API_SECRET", "")
 # Base of the external sign-in URL; the user's phone is appended as a query arg.
 LOGIN_URL_BASE = os.getenv("LOGIN_URL_BASE", "https://qa.sugardaddy.cy/sign-in")
+# How long cached login data stays valid. Past this we ask the user to log in
+# again so we never act on stale account status/labels.
+ACCOUNT_FRESHNESS_HOURS = int(os.getenv("ACCOUNT_FRESHNESS_HOURS", "72"))
 
 
 @asynccontextmanager
@@ -241,22 +245,55 @@ ACCOUNT_TOOLS = [
 TOOLS_ALL = TOOLS + ACCOUNT_TOOLS
 
 
+def _login_is_stale(user: dict) -> bool:
+    """True if the cached login is older than ACCOUNT_FRESHNESS_HOURS (or undatable)."""
+    raw = user.get("updated_at")
+    if isinstance(raw, datetime):
+        dt = raw
+    elif isinstance(raw, str):
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError:
+            return True
+    else:
+        return True
+    if dt.tzinfo is None:  # SQLite hands back naive datetimes; they are UTC.
+        dt = dt.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+    return age_hours > ACCOUNT_FRESHNESS_HOURS
+
+
+def _not_logged_in(phone: str, *, stale: bool) -> str:
+    login_url = f"{LOGIN_URL_BASE}?phoneNumber={quote(phone, safe='')}"
+    if stale:
+        instructions = (
+            f"המידע השמור על הלקוח ישן (עברו יותר מ-{ACCOUNT_FRESHNESS_HOURS} שעות "
+            "מההתחברות האחרונה). בקש/י ממנו להתחבר שוב דרך login_url כדי לרענן, "
+            "ושלח/י לו את הקישור כפי שהוא."
+        )
+    else:
+        instructions = (
+            "הלקוח לא מחובר. בקש/י ממנו להתחבר דרך login_url כדי שתוכל/י "
+            "לראות את הסטטוס שלו, ושלח/י לו את הקישור כפי שהוא."
+        )
+    return json.dumps(
+        {"logged_in": False, "stale": stale, "login_url": login_url, "instructions": instructions},
+        ensure_ascii=False,
+    )
+
+
 def _account_status_for(phone: str) -> str:
-    """Resolve get_account_status for `phone`. Returns a JSON string (tool result)."""
+    """Resolve get_account_status for `phone`. Returns a JSON string (tool result).
+
+    Login data is cached in the DB on /auth/callback. We serve it only while
+    fresh (< ACCOUNT_FRESHNESS_HOURS since last login); a missing or stale row
+    routes the bot back to the login step so we never act on stale labels.
+    """
     user = db.get_user_by_phone(phone)
     if user is None:
-        login_url = f"{LOGIN_URL_BASE}?phoneNumber={quote(phone, safe='')}"
-        return json.dumps(
-            {
-                "logged_in": False,
-                "login_url": login_url,
-                "instructions": (
-                    "הלקוח לא מחובר. בקש/י ממנו להתחבר דרך login_url כדי שתוכל/י "
-                    "לראות את הסטטוס שלו, ושלח/י לו את הקישור כפי שהוא."
-                ),
-            },
-            ensure_ascii=False,
-        )
+        return _not_logged_in(phone, stale=False)
+    if _login_is_stale(user):
+        return _not_logged_in(phone, stale=True)
     return json.dumps(
         {
             "logged_in": True,
