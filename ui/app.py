@@ -4,9 +4,10 @@ Run with:
     uv run streamlit run ui/app.py
 
 All LLM work happens in server.py (FastAPI). This file only renders the
-chat surface and talks to the backend via HTTP. The phone-number input
-in the sidebar is the per-conversation identity (later this becomes the
-real WhatsApp sender; for now you type a test number).
+chat surface and talks to the backend via HTTP. An up-front phone gate
+captures the per-conversation identity before the chat opens (later this
+becomes the real WhatsApp sender; for now you type a test number). The
+sidebar lets you switch numbers, which starts a fresh conversation.
 
 Env:
     CHAT_API_URL          backend base URL (default http://localhost:8000)
@@ -15,6 +16,7 @@ Env:
 
 import json
 import os
+import re
 import sys
 
 import requests
@@ -72,6 +74,19 @@ st.markdown(
 
 st.title("שירות לקוחות שוגר דדי")
 st.caption(f"backend: {API_URL}")
+
+
+# ---------- phone ----------
+
+def normalize_phone(raw: str) -> str | None:
+    """Canonicalize an Israeli mobile to `05XXXXXXXX`, or None if invalid.
+
+    Accepts local (`050-123 4567`) and international (`+972`, `972`) forms so
+    the same person always keys to the same conversation history.
+    """
+    digits = re.sub(r"[^\d+]", "", raw or "")
+    digits = re.sub(r"^(?:\+?972)", "0", digits)
+    return digits if re.fullmatch(r"05\d{8}", digits) else None
 
 
 # ---------- backend client ----------
@@ -137,13 +152,34 @@ def stream_assistant_reply(phone: str, message: str):
 # ---------- session-state ----------
 
 if "phone" not in st.session_state:
-    st.session_state.phone = DEFAULT_PHONE
+    st.session_state.phone = None
+if "phone_confirmed" not in st.session_state:
+    st.session_state.phone_confirmed = False
 if "history_phone" not in st.session_state:
     st.session_state.history_phone = None
 if "history" not in st.session_state:
     st.session_state.history = []
 if "stats" not in st.session_state:
     st.session_state.stats = []
+
+
+# ---------- phone gate ----------
+# Capture the conversation identity before anything else. Mimics WhatsApp
+# knowing the sender's number; the chat surface below never renders until a
+# valid phone is confirmed.
+if not st.session_state.phone_confirmed:
+    st.write("ברוך/ה הבא/ה! כדי שנוכל לעזור, הזן/י את מספר הטלפון שלך.")
+    with st.form("phone_gate"):
+        raw_phone = st.text_input("מספר טלפון", value=DEFAULT_PHONE)
+        if st.form_submit_button("התחל שיחה", use_container_width=True):
+            normalized = normalize_phone(raw_phone)
+            if normalized is None:
+                st.error("מספר טלפון לא תקין — הזן/י מספר נייד ישראלי, למשל 0501234567")
+            else:
+                st.session_state.phone = normalized
+                st.session_state.phone_confirmed = True
+                st.rerun()
+    st.stop()
 
 
 # Refresh history from the backend when the phone changes (or first load).
@@ -186,9 +222,14 @@ if user_input := st.chat_input("כתוב הודעה..."):
 
 with st.sidebar:
     st.header("הגדרות")
-    new_phone = st.text_input("מספר טלפון", value=st.session_state.phone, key="phone_input")
-    if new_phone and new_phone != st.session_state.phone:
-        st.session_state.phone = new_phone
+    st.caption("מספר טלפון")
+    st.write(f"**{st.session_state.phone}**")
+    if st.button("📱 החלף מספר", use_container_width=True):
+        st.session_state.phone = None
+        st.session_state.phone_confirmed = False
+        st.session_state.history = []
+        st.session_state.stats = []
+        st.session_state.pop("_last_usage", None)
         st.rerun()
 
     if st.button("🔄 שיחה חדשה", use_container_width=True):
