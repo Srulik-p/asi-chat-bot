@@ -23,7 +23,7 @@ os.environ["OPENAI_API_KEY"] = "dummy-for-smoke-test"
 os.environ["AUTH_CALLBACK_SECRET"] = "smoke-secret"
 os.environ["INTERNAL_API_SECRET"] = "smoke-internal"
 os.environ["OUTBOUND_SEND_URL"] = ""  # notifier must no-op, not call anything real
-os.environ["LOGIN_URL_BASE"] = "https://qa.sugardaddy.cy/sign-in"
+os.environ["LOGIN_URL_BASE"] = "https://qa.sugardaddy.co.il/sign-in"
 
 from sugarbot import db  # noqa: E402
 
@@ -39,7 +39,7 @@ phone = "+972501234567"
 # 1) Not in DB yet -> logged_in false + exact login URL
 st = json.loads(server._account_status_for(phone))
 assert st["logged_in"] is False, st
-assert st["login_url"] == "https://qa.sugardaddy.cy/sign-in?phoneNumber=%2B972501234567", st
+assert st["login_url"] == "https://qa.sugardaddy.co.il/sign-in?phoneNumber=%2B972501234567", st
 print("1. unknown user -> logged_in=false, login_url:", st["login_url"])
 
 # 2) Callback without/with wrong secret -> 401
@@ -93,7 +93,7 @@ with db._engine.begin() as conn:
     )
 st = json.loads(server._account_status_for(phone))
 assert st["logged_in"] is False and st.get("stale") is True, st
-assert st["login_url"].startswith("https://qa.sugardaddy.cy/sign-in?phoneNumber="), st
+assert st["login_url"].startswith("https://qa.sugardaddy.co.il/sign-in?phoneNumber="), st
 print("6. stale login (>72h) -> logged_in=false, stale=true")
 
 print("\nALL CHECKS PASSED")

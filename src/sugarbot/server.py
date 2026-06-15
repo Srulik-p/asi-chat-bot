@@ -69,7 +69,7 @@ load_dotenv()
 WEBHOOK_SECRET = os.getenv("AUTH_CALLBACK_SECRET", "")
 INTERNAL_SECRET = os.getenv("INTERNAL_API_SECRET", "")
 # Base of the external sign-in URL; the user's phone is appended as a query arg.
-LOGIN_URL_BASE = os.getenv("LOGIN_URL_BASE", "https://qa.sugardaddy.cy/sign-in")
+LOGIN_URL_BASE = os.getenv("LOGIN_URL_BASE", "https://qa.sugardaddy.co.il/sign-in")
 # How long cached login data stays valid. Past this we ask the user to log in
 # again so we never act on stale account status/labels.
 ACCOUNT_FRESHNESS_HOURS = int(os.getenv("ACCOUNT_FRESHNESS_HOURS", "72"))
