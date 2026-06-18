@@ -30,6 +30,13 @@ POST /auth/callback
     Effect:  upsert users row by phoneNumber, then push a "connected" message
              to the user via the outbound sender (best-effort, in background).
 
+POST /maintenance/sweep-idle
+    Headers: X-Internal-Secret
+    Effect:  one inactivity-sweep pass — warns conversations quiet for
+             INACTIVITY_WARN_HOURS, closes them at INACTIVITY_CLOSE_HOURS.
+    Returns: {"scanned": n, "warned": n, "closed": n}
+    Wire a scheduler (e.g. Cloud Scheduler) to call this hourly.
+
 GET  /healthz
 """
 
@@ -40,7 +47,7 @@ import json
 import os
 import sys
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, AsyncIterator, Iterator
 from urllib.parse import quote
 
@@ -73,6 +80,20 @@ LOGIN_URL_BASE = os.getenv("LOGIN_URL_BASE", "https://qa.sugardaddy.co.il/sign-i
 # How long cached login data stays valid. Past this we ask the user to log in
 # again so we never act on stale account status/labels.
 ACCOUNT_FRESHNESS_HOURS = int(os.getenv("ACCOUNT_FRESHNESS_HOURS", "72"))
+# Inactivity auto-close: warn after the conversation has been waiting on the
+# customer for INACTIVITY_WARN_HOURS, then close it INACTIVITY_CLOSE_HOURS after
+# the last activity if still no reply. Driven by /maintenance/sweep-idle.
+INACTIVITY_WARN_HOURS = int(os.getenv("INACTIVITY_WARN_HOURS", "24"))
+INACTIVITY_CLOSE_HOURS = int(os.getenv("INACTIVITY_CLOSE_HOURS", "48"))
+
+INACTIVITY_WARN_MESSAGE = (
+    "היי, רק רצינו לוודא שאנחנו עדיין כאן בשבילך 🙂 אם לא נשמע ממך נסגור את "
+    "הפנייה בקרוב - אפשר פשוט להמשיך לכתוב כדי שנמשיך, או לכתוב 'סגור' אם הסתדר."
+)
+INACTIVITY_CLOSE_MESSAGE = (
+    "סגרנו את הפנייה כרגע כי לא שמענו ממך. תמיד אפשר לכתוב לנו שוב ונשמח לעזור. "
+    "המשך יום נעים 🙂"
+)
 
 
 @asynccontextmanager
@@ -172,8 +193,8 @@ def _connected_message(nickname: str | None) -> str:
     hi = f"היי {nickname}, " if nickname else "היי, "
     return (
         hi
-        + "אני רואה שהתחברת בהצלחה 🙂 עכשיו אני יכולה לראות את הסטטוס שלך "
-        + "ולעזור לך עם כל מה שקשור לחשבון. במה אפשר לעזור?"
+        + "אנחנו רואים שהתחברת בהצלחה 🙂 עכשיו אפשר לראות את הסטטוס שלך "
+        + "ולעזור עם כל מה שקשור לחשבון. במה אפשר לעזור?"
     )
 
 
@@ -268,13 +289,15 @@ def _not_logged_in(phone: str, *, stale: bool) -> str:
     if stale:
         instructions = (
             f"המידע השמור על הלקוח ישן (עברו יותר מ-{ACCOUNT_FRESHNESS_HOURS} שעות "
-            "מההתחברות האחרונה). בקש/י ממנו להתחבר שוב דרך login_url כדי לרענן, "
-            "ושלח/י לו את הקישור כפי שהוא."
+            "מההתחברות האחרונה). בקש/י ממנו להתחבר שוב כדי לרענן, ושלח/י לו את "
+            "הערך של השדה login_url (כתובת ה-URL המלאה) כקישור לחיץ. אל תכתוב/י "
+            "את המילה 'login_url' או סוגריים - רק את הכתובת עצמה."
         )
     else:
         instructions = (
-            "הלקוח לא מחובר. בקש/י ממנו להתחבר דרך login_url כדי שתוכל/י "
-            "לראות את הסטטוס שלו, ושלח/י לו את הקישור כפי שהוא."
+            "הלקוח לא מחובר. בקש/י ממנו להתחבר כדי שתוכל/י לראות את הסטטוס שלו, "
+            "ושלח/י לו את הערך של השדה login_url (כתובת ה-URL המלאה) כקישור לחיץ. "
+            "אל תכתוב/י את המילה 'login_url' או סוגריים - רק את הכתובת עצמה."
         )
     return json.dumps(
         {"logged_in": False, "stale": stale, "login_url": login_url, "instructions": instructions},
@@ -416,6 +439,61 @@ def chat_reset(
 ) -> dict:
     _check_secret(x_internal_secret, INTERNAL_SECRET, "INTERNAL_API_SECRET")
     return {"deleted": db.clear_history(payload.phoneNumber)}
+
+
+# ---------- maintenance: inactivity auto-close ----------
+
+def _sweep_idle() -> dict:
+    """One pass of the inactivity sweep. Warns quiet conversations, then closes
+    them if the warning went unanswered. Idempotent per state transition.
+
+    Semantics: a conversation is "waiting" when its latest message is an
+    assistant reply. After INACTIVITY_WARN_HOURS of silence we send a pre-close
+    warning (recorded as the new latest message). The warning is then itself
+    subject to the idle clock, so once (INACTIVITY_CLOSE_HOURS - WARN) more hours
+    pass with no customer reply we close the inquiry. A new customer message
+    clears the state (see db.append_message) and reopens the conversation.
+    """
+    now = datetime.now(timezone.utc)
+    warn_delta = timedelta(hours=INACTIVITY_WARN_HOURS)
+    close_grace = timedelta(hours=max(INACTIVITY_CLOSE_HOURS - INACTIVITY_WARN_HOURS, 0))
+    # Bound the scan to conversations idle at least as long as the sooner of the
+    # two transitions could fire.
+    min_idle = min(warn_delta, close_grace) if close_grace else warn_delta
+    convos = db.idle_assistant_conversations(now - min_idle)
+
+    warned = closed = 0
+    for c in convos:
+        phone = c["phone_number"]
+        if c["last_warned_at"] is None:
+            if now - c["last_message_at"] >= warn_delta:
+                # Only advance the state machine if the warning was actually
+                # delivered. Otherwise a no-op/failed outbound channel would
+                # close inquiries the customer was never warned about; leaving
+                # the state untouched lets the next sweep retry the warning.
+                if notifier.send_message(phone, INACTIVITY_WARN_MESSAGE):
+                    db.append_message(phone, "assistant", content=INACTIVITY_WARN_MESSAGE)
+                    db.mark_warned(phone, now)
+                    warned += 1
+        else:
+            if now - c["last_warned_at"] >= close_grace:
+                # Same rule for the close: never mark closed unless the closing
+                # message reached the customer.
+                if notifier.send_message(phone, INACTIVITY_CLOSE_MESSAGE):
+                    db.append_message(phone, "assistant", content=INACTIVITY_CLOSE_MESSAGE)
+                    db.mark_closed(phone, now)
+                    closed += 1
+    return {"scanned": len(convos), "warned": warned, "closed": closed}
+
+
+@app.post("/maintenance/sweep-idle")
+def sweep_idle(
+    x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
+) -> dict:
+    """Trigger one inactivity sweep. Wire a scheduler (e.g. Cloud Scheduler) to
+    call this hourly. Guarded by the internal secret."""
+    _check_secret(x_internal_secret, INTERNAL_SECRET, "INTERNAL_API_SECRET")
+    return _sweep_idle()
 
 
 # ---------- health ----------

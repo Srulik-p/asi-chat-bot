@@ -168,7 +168,10 @@ if "stats" not in st.session_state:
 # knowing the sender's number; the chat surface below never renders until a
 # valid phone is confirmed.
 if not st.session_state.phone_confirmed:
-    st.write("ברוך/ה הבא/ה! כדי שנוכל לעזור, הזן/י את מספר הטלפון שלך.")
+    st.write(
+        "מצב בדיקה: הזן/י מספר טלפון לזיהוי השיחה. "
+        "בוואטסאפ הזיהוי אוטומטי לפי מספר השולח - כאן מקלידים אותו ידנית לבדיקה."
+    )
     with st.form("phone_gate"):
         raw_phone = st.text_input("מספר טלפון", value=DEFAULT_PHONE)
         if st.form_submit_button("התחל שיחה", use_container_width=True):
@@ -202,14 +205,39 @@ for msg in st.session_state.history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-if user_input := st.chat_input("כתוב הודעה..."):
+chat_value = st.chat_input(
+    "כתוב הודעה...",
+    accept_file=True,
+    file_type=["png", "jpg", "jpeg"],
+)
+if chat_value:
     phone = st.session_state.phone
-    st.session_state.history.append({"role": "user", "content": user_input})
+    # With accept_file the value is a ChatInputValue (.text + .files); guard for
+    # the plain-string form too.
+    text = (getattr(chat_value, "text", None) or "").strip() or (
+        chat_value if isinstance(chat_value, str) else ""
+    )
+    files = list(getattr(chat_value, "files", []) or [])
+
     with st.chat_message("user"):
-        st.markdown(user_input)
+        if text:
+            st.markdown(text)
+        for f in files:
+            st.image(f)
+
+    # The backend chat API currently accepts text only. We flag attachments so
+    # the screenshot-based flows the bot asks for aren't silently dropped.
+    # Real image handling (store + show to a human rep / vision) is a follow-up.
+    if files:
+        note = "[המשתמש צירף תמונה/צילום מסך]"
+        outgoing = f"{text}\n{note}" if text else note
+    else:
+        outgoing = text
+
+    st.session_state.history.append({"role": "user", "content": text or "📎 תמונה"})
 
     with st.chat_message("assistant"):
-        full_text = st.write_stream(stream_assistant_reply(phone, user_input))
+        full_text = st.write_stream(stream_assistant_reply(phone, outgoing))
 
     st.session_state.history.append({"role": "assistant", "content": full_text or ""})
     last_usage = st.session_state.get("_last_usage")

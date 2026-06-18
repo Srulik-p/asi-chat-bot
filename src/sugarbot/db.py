@@ -27,6 +27,7 @@ from sqlalchemy import (
     Text,
     create_engine,
     delete,
+    func,
     select,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -93,6 +94,19 @@ messages_table = Table(
     Column("tool_calls", JSON),               # list[dict] when present
     Column("tool_call_id", String),           # set for role=tool
     Column("created_at", DateTime, nullable=False),
+)
+
+
+# Per-conversation lifecycle state for the inactivity auto-close sweep. Separate
+# from messages so we can record "warned"/"closed" without polluting the chat
+# log replay. A row appears the first time a conversation is warned; it is
+# deleted whenever the customer sends a new message (which reopens the inquiry).
+conversation_state_table = Table(
+    "conversation_state",
+    _metadata,
+    Column("phone_number", String, primary_key=True),
+    Column("last_warned_at", DateTime),  # when the pre-close warning was sent
+    Column("closed_at", DateTime),       # when the inquiry was auto-closed
 )
 
 
@@ -209,6 +223,14 @@ def append_message(
                 created_at=datetime.now(timezone.utc),
             )
         )
+        # A new customer message reopens the inquiry: drop any warned/closed
+        # state so the auto-close sweep starts the idle clock fresh.
+        if role == "user":
+            conn.execute(
+                delete(conversation_state_table).where(
+                    conversation_state_table.c.phone_number == phone_number
+                )
+            )
 
 
 def load_history(phone_number: str) -> list[dict]:
@@ -236,3 +258,96 @@ def clear_history(phone_number: str) -> int:
             delete(messages_table).where(messages_table.c.phone_number == phone_number)
         )
         return result.rowcount or 0
+
+
+# ---------- inactivity auto-close ----------
+
+def _as_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Normalize a stored timestamp to tz-aware UTC (SQLite hands back naive)."""
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def idle_assistant_conversations(idle_before: datetime) -> list[dict]:
+    """Conversations awaiting a customer reply that have gone quiet.
+
+    Returns one entry per conversation whose most-recent message is an assistant
+    reply created at or before `idle_before` and that has not been auto-closed.
+    Each entry carries the last-message timestamp and the warn/close state so the
+    sweep can decide whether to warn or close. Timestamps are tz-aware UTC.
+    """
+    latest = (
+        select(
+            messages_table.c.phone_number,
+            func.max(messages_table.c.id).label("mid"),
+        )
+        .group_by(messages_table.c.phone_number)
+        .subquery()
+    )
+    m = messages_table
+    cs = conversation_state_table
+    stmt = (
+        select(
+            m.c.phone_number,
+            m.c.created_at,
+            cs.c.last_warned_at,
+            cs.c.closed_at,
+        )
+        .select_from(
+            latest.join(m, m.c.id == latest.c.mid).outerjoin(
+                cs, cs.c.phone_number == m.c.phone_number
+            )
+        )
+        .where(m.c.role == "assistant")
+        .where(m.c.created_at <= idle_before)
+    )
+    with _engine.connect() as conn:
+        rows = conn.execute(stmt).mappings().all()
+    out: list[dict] = []
+    for r in rows:
+        if r["closed_at"] is not None:
+            continue
+        out.append(
+            {
+                "phone_number": r["phone_number"],
+                "last_message_at": _as_utc(r["created_at"]),
+                "last_warned_at": _as_utc(r["last_warned_at"]),
+            }
+        )
+    return out
+
+
+def _upsert_conversation_state(phone_number: str, **values) -> None:
+    insert = pg_insert if _IS_POSTGRES else sqlite_insert
+    stmt = insert(conversation_state_table).values(phone_number=phone_number, **values)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[conversation_state_table.c.phone_number],
+        set_=values,
+    )
+    with _engine.begin() as conn:
+        conn.execute(stmt)
+
+
+def mark_warned(phone_number: str, when: datetime) -> None:
+    _upsert_conversation_state(phone_number, last_warned_at=when)
+
+
+def mark_closed(phone_number: str, when: datetime) -> None:
+    _upsert_conversation_state(phone_number, closed_at=when)
+
+
+def get_conversation_state(phone_number: str) -> Optional[dict]:
+    with _engine.connect() as conn:
+        row = conn.execute(
+            select(conversation_state_table).where(
+                conversation_state_table.c.phone_number == phone_number
+            )
+        ).mappings().first()
+    if not row:
+        return None
+    return {
+        "phone_number": row["phone_number"],
+        "last_warned_at": _as_utc(row["last_warned_at"]),
+        "closed_at": _as_utc(row["closed_at"]),
+    }
