@@ -24,6 +24,13 @@ POST /chat/reset
     Body:    { phoneNumber }
     Returns: {"deleted": n}
 
+POST /user/delete
+    Headers: X-Internal-Secret
+    Body:    { phoneNumber }
+    Effect:  erase ALL data for the phone — chat history, cached login row,
+             and conversation state (full "forget me" / account purge).
+    Returns: {"messages": n, "user": n, "conversation_state": n}
+
 POST /auth/callback
     Headers: X-Webhook-Secret: <AUTH_CALLBACK_SECRET>
     Body:    { phoneNumber, user:{id,nickname,isPremium,labels:[{id,name}]}, accessToken }
@@ -85,6 +92,10 @@ ACCOUNT_FRESHNESS_HOURS = int(os.getenv("ACCOUNT_FRESHNESS_HOURS", "72"))
 # the last activity if still no reply. Driven by /maintenance/sweep-idle.
 INACTIVITY_WARN_HOURS = int(os.getenv("INACTIVITY_WARN_HOURS", "24"))
 INACTIVITY_CLOSE_HOURS = int(os.getenv("INACTIVITY_CLOSE_HOURS", "48"))
+# Max conversations processed per sweep call, oldest-idle first. Bounds the
+# request's wall-clock so it can't exceed the scheduler/gateway timeout (worst
+# case ~= limit * OUTBOUND_SEND_TIMEOUT); the backlog drains over later calls.
+INACTIVITY_SWEEP_LIMIT = int(os.getenv("INACTIVITY_SWEEP_LIMIT", "100"))
 
 INACTIVITY_WARN_MESSAGE = (
     "היי, רק רצינו לוודא שאנחנו עדיין כאן בשבילך 🙂 אם לא נשמע ממך נסגור את "
@@ -260,7 +271,24 @@ ACCOUNT_TOOLS = [
             ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "escalate_to_human",
+            "description": (
+                "Record that you are handing this conversation to a human "
+                "representative. Call this WHENEVER you tell the customer you are "
+                "forwarding to the team / that a human will get back to them "
+                "(refunds, blocked appeals, double charges, serious reports, an "
+                "explicit request for a human, etc.) — in addition to your message "
+                "to the customer. It marks the inquiry as awaiting a rep so the "
+                "system does not auto-close it while a reply is still owed. Takes "
+                "no arguments — the conversation is identified automatically."
+            ),
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
 ]
 
 TOOLS_ALL = TOOLS + ACCOUNT_TOOLS
@@ -383,6 +411,9 @@ def _run_chat(phone: str, user_message: str) -> Iterator[dict]:
                     if name == "get_account_status":
                         # Resolved from the conversation identity + DB, not the model args.
                         result = _account_status_for(phone)
+                    elif name == "escalate_to_human":
+                        db.mark_escalated(phone, datetime.now(timezone.utc))
+                        result = json.dumps({"escalated": True}, ensure_ascii=False)
                     else:
                         fn = TOOL_FNS.get(name)
                         if fn is None:
@@ -441,6 +472,18 @@ def chat_reset(
     return {"deleted": db.clear_history(payload.phoneNumber)}
 
 
+@app.post("/user/delete")
+def user_delete(
+    payload: ChatResetIn,
+    x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
+) -> dict:
+    """Erase ALL stored data for a phone number — chat history, cached login
+    row, and conversation state. Use for a full 'forget me' / account purge
+    (unlike /chat/reset, which only clears the chat history)."""
+    _check_secret(x_internal_secret, INTERNAL_SECRET, "INTERNAL_API_SECRET")
+    return db.delete_user_data(payload.phoneNumber)
+
+
 # ---------- maintenance: inactivity auto-close ----------
 
 def _sweep_idle() -> dict:
@@ -460,7 +503,7 @@ def _sweep_idle() -> dict:
     # Bound the scan to conversations idle at least as long as the sooner of the
     # two transitions could fire.
     min_idle = min(warn_delta, close_grace) if close_grace else warn_delta
-    convos = db.idle_assistant_conversations(now - min_idle)
+    convos = db.idle_assistant_conversations(now - min_idle, limit=INACTIVITY_SWEEP_LIMIT)
 
     warned = closed = 0
     for c in convos:

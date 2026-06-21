@@ -57,9 +57,15 @@ fresh = "+972500000002"
 _insert(fresh, "user", "שאלה", 1)
 _insert(fresh, "assistant", "הנה התשובה", 1)
 
+# Escalated conversation: idle 50h but handed to a human -> sweep must skip it.
+esc = "+972500000003"
+_insert(esc, "user", "אני רוצה נציג", 50)
+_insert(esc, "assistant", "מעביר לצוות, יחזרו אליך", 50)
+db.mark_escalated(esc, now)
+
 # 0) Delivery-gated: with the outbound channel unconfigured (send returns
 # False) the sweep must NOT advance state — never close an inquiry the customer
-# was never warned about.
+# was never warned about. Escalated/fresh convos are excluded, so scanned == 1.
 res = server._sweep_idle()
 assert res == {"scanned": 1, "warned": 0, "closed": 0}, res
 assert db.get_conversation_state(idle) is None, "failed delivery must not warn"
@@ -70,14 +76,17 @@ from sugarbot import notifier  # noqa: E402
 
 notifier.send_message = lambda phone, message: True
 
-# 1) First sweep -> warn the idle one, leave the fresh one alone.
+# 1) First sweep -> warn the idle one, leave the fresh and escalated ones alone.
 res = server._sweep_idle()
 assert res["warned"] == 1, res
 assert res["closed"] == 0, res
 state = db.get_conversation_state(idle)
 assert state and state["last_warned_at"] is not None and state["closed_at"] is None, state
 assert db.get_conversation_state(fresh) is None, "fresh conversation should be untouched"
-print("1. first sweep -> warned idle, fresh untouched:", res)
+esc_state = db.get_conversation_state(esc)
+assert esc_state and esc_state["last_warned_at"] is None, "escalated conversation must be skipped"
+assert esc_state["escalated_at"] is not None, esc_state
+print("1. first sweep -> warned idle; fresh + escalated untouched:", res)
 
 # 2) Backdate the warning (both the delivered warning message and the warned-at
 # marker) so the close grace has elapsed, then sweep -> close.

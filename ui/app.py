@@ -115,6 +115,18 @@ def reset_history(phone: str) -> None:
     ).raise_for_status()
 
 
+def purge_user(phone: str) -> dict:
+    """Erase ALL data for the phone (history + login row + conversation state)."""
+    r = requests.post(
+        f"{API_URL}/user/delete",
+        json={"phoneNumber": phone},
+        headers=_headers(),
+        timeout=REQUEST_TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def stream_assistant_reply(phone: str, message: str):
     """Generator yielding plain-text deltas; stashes final usage in session_state."""
     st.session_state._last_usage = None
@@ -269,6 +281,29 @@ with st.sidebar:
         st.session_state.stats = []
         st.session_state.pop("_last_usage", None)
         st.rerun()
+
+    st.divider()
+    st.caption("מחיקת נתונים")
+    confirm_purge = st.checkbox("אני מבין/ה שזה ימחק הכל לצמיתות")
+    if st.button(
+        "🗑️ מחק את כל הנתונים של המספר",
+        use_container_width=True,
+        disabled=not confirm_purge,
+        help="היסטוריית צ'אט + נתוני התחברות + סטטוס שיחה",
+    ):
+        try:
+            counts = purge_user(st.session_state.phone)
+        except requests.RequestException as e:
+            st.error(f"כשל במחיקה: {e}")
+        else:
+            # Everything for this number is gone — drop back to the phone gate.
+            st.session_state.phone = None
+            st.session_state.phone_confirmed = False
+            st.session_state.history = []
+            st.session_state.stats = []
+            st.session_state.pop("_last_usage", None)
+            st.toast(f"נמחק: {counts}")
+            st.rerun()
 
     st.divider()
     st.subheader("סטטיסטיקות")

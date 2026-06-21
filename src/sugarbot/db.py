@@ -107,6 +107,7 @@ conversation_state_table = Table(
     Column("phone_number", String, primary_key=True),
     Column("last_warned_at", DateTime),  # when the pre-close warning was sent
     Column("closed_at", DateTime),       # when the inquiry was auto-closed
+    Column("escalated_at", DateTime),    # handed to a human rep — exempt from auto-close
 )
 
 
@@ -260,6 +261,28 @@ def clear_history(phone_number: str) -> int:
         return result.rowcount or 0
 
 
+def delete_user_data(phone_number: str) -> dict:
+    """Erase everything stored for a phone number: chat history, the cached
+    login row (nickname/labels/access token), and conversation lifecycle state.
+
+    Atomic — all three deletes share one transaction. Returns the per-table row
+    counts removed.
+    """
+    with _engine.begin() as conn:
+        messages = conn.execute(
+            delete(messages_table).where(messages_table.c.phone_number == phone_number)
+        ).rowcount or 0
+        user = conn.execute(
+            delete(users_table).where(users_table.c.phone_number == phone_number)
+        ).rowcount or 0
+        state = conn.execute(
+            delete(conversation_state_table).where(
+                conversation_state_table.c.phone_number == phone_number
+            )
+        ).rowcount or 0
+    return {"messages": messages, "user": user, "conversation_state": state}
+
+
 # ---------- inactivity auto-close ----------
 
 def _as_utc(dt: Optional[datetime]) -> Optional[datetime]:
@@ -269,13 +292,18 @@ def _as_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-def idle_assistant_conversations(idle_before: datetime) -> list[dict]:
+def idle_assistant_conversations(idle_before: datetime, limit: int = 200) -> list[dict]:
     """Conversations awaiting a customer reply that have gone quiet.
 
-    Returns one entry per conversation whose most-recent message is an assistant
-    reply created at or before `idle_before` and that has not been auto-closed.
-    Each entry carries the last-message timestamp and the warn/close state so the
-    sweep can decide whether to warn or close. Timestamps are tz-aware UTC.
+    Returns up to `limit` entries (oldest-idle first) for conversations whose
+    most-recent message is an assistant reply created at or before `idle_before`
+    and that have NOT been auto-closed or handed to a human rep. Each entry
+    carries the last-message timestamp and the warn state so the sweep can decide
+    whether to warn or close. Timestamps are tz-aware UTC.
+
+    Closed/escalated conversations are excluded in SQL so `limit` always yields
+    actionable rows; ordering oldest-first means the most-overdue are handled
+    even when the backlog exceeds one batch.
     """
     latest = (
         select(
@@ -292,7 +320,6 @@ def idle_assistant_conversations(idle_before: datetime) -> list[dict]:
             m.c.phone_number,
             m.c.created_at,
             cs.c.last_warned_at,
-            cs.c.closed_at,
         )
         .select_from(
             latest.join(m, m.c.id == latest.c.mid).outerjoin(
@@ -301,21 +328,22 @@ def idle_assistant_conversations(idle_before: datetime) -> list[dict]:
         )
         .where(m.c.role == "assistant")
         .where(m.c.created_at <= idle_before)
+        # outer-joined NULLs (no state row) pass; only set closed/escalated drop.
+        .where(cs.c.closed_at.is_(None))
+        .where(cs.c.escalated_at.is_(None))
+        .order_by(m.c.created_at.asc())
+        .limit(limit)
     )
     with _engine.connect() as conn:
         rows = conn.execute(stmt).mappings().all()
-    out: list[dict] = []
-    for r in rows:
-        if r["closed_at"] is not None:
-            continue
-        out.append(
-            {
-                "phone_number": r["phone_number"],
-                "last_message_at": _as_utc(r["created_at"]),
-                "last_warned_at": _as_utc(r["last_warned_at"]),
-            }
-        )
-    return out
+    return [
+        {
+            "phone_number": r["phone_number"],
+            "last_message_at": _as_utc(r["created_at"]),
+            "last_warned_at": _as_utc(r["last_warned_at"]),
+        }
+        for r in rows
+    ]
 
 
 def _upsert_conversation_state(phone_number: str, **values) -> None:
@@ -337,6 +365,13 @@ def mark_closed(phone_number: str, when: datetime) -> None:
     _upsert_conversation_state(phone_number, closed_at=when)
 
 
+def mark_escalated(phone_number: str, when: datetime) -> None:
+    """Flag a conversation as handed to a human rep. The inactivity sweep skips
+    escalated conversations so we never auto-close a ticket a rep still owes a
+    reply on. Cleared when the customer sends a new message (see append_message)."""
+    _upsert_conversation_state(phone_number, escalated_at=when)
+
+
 def get_conversation_state(phone_number: str) -> Optional[dict]:
     with _engine.connect() as conn:
         row = conn.execute(
@@ -350,4 +385,5 @@ def get_conversation_state(phone_number: str) -> Optional[dict]:
         "phone_number": row["phone_number"],
         "last_warned_at": _as_utc(row["last_warned_at"]),
         "closed_at": _as_utc(row["closed_at"]),
+        "escalated_at": _as_utc(row["escalated_at"]),
     }

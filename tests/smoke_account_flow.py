@@ -96,4 +96,22 @@ assert st["logged_in"] is False and st.get("stale") is True, st
 assert st["login_url"].startswith("https://qa.sugardaddy.co.il/sign-in?phoneNumber="), st
 print("6. stale login (>72h) -> logged_in=false, stale=true")
 
+# 7) /user/delete erases history + login row + conversation state.
+db.append_message(phone, "user", content="היי")
+db.append_message(phone, "assistant", content="שלום")
+db.mark_warned(phone, _dt.datetime.now(_dt.timezone.utc))
+assert db.get_user_by_phone(phone) is not None
+assert len(db.load_history(phone)) == 2
+
+assert client.post("/user/delete", json={"phoneNumber": phone}).status_code == 401
+r = client.post(
+    "/user/delete", json={"phoneNumber": phone}, headers={"X-Internal-Secret": "smoke-internal"}
+)
+assert r.status_code == 200, (r.status_code, r.text)
+assert r.json() == {"messages": 2, "user": 1, "conversation_state": 1}, r.json()
+assert db.get_user_by_phone(phone) is None, "user row should be gone"
+assert db.load_history(phone) == [], "history should be gone"
+assert db.get_conversation_state(phone) is None, "conversation state should be gone"
+print("7. /user/delete -> all data erased:", r.json())
+
 print("\nALL CHECKS PASSED")
