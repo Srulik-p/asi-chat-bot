@@ -53,6 +53,7 @@ import hmac
 import json
 import os
 import sys
+import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, AsyncIterator, Iterator
@@ -433,7 +434,12 @@ def _run_chat(phone: str, user_message: str) -> Iterator[dict]:
             yield {"type": "done", "usage": total}
             return
     except Exception as e:
-        # Stream a structured error so the client can render a polite message.
+        # Log server-side (Cloud Run captures stderr) so the failure is actually
+        # diagnosable — otherwise the request shows only as 200 OK and the real
+        # exception is lost. Then stream a structured error for a polite client
+        # message.
+        print(f"[chat] _run_chat failed for {phone}: {type(e).__name__}: {e}", file=sys.stderr)
+        traceback.print_exc()
         yield {"type": "error", "message": f"{type(e).__name__}: {e}"}
 
 
