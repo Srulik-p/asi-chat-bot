@@ -76,6 +76,7 @@ from sugarbot.assistant import (
     add_usage,
     client,
     empty_usage,
+    repair_tool_calls,
     scrub_messages,
 )
 
@@ -372,6 +373,9 @@ def _run_chat(phone: str, user_message: str) -> Iterator[dict]:
     history = db.load_history(phone)
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
     messages = scrub_messages(messages)
+    # Heal any dangling tool-call pairs left by an earlier interrupted turn so a
+    # single poisoned turn can't 400 the conversation forever.
+    messages = repair_tool_calls(messages)
 
     total = empty_usage()
 
@@ -409,22 +413,29 @@ def _run_chat(phone: str, user_message: str) -> Iterator[dict]:
 
                 for tc in msg.tool_calls:
                     name = tc.function.name
-                    if name == "get_account_status":
-                        # Resolved from the conversation identity + DB, not the model args.
-                        result = _account_status_for(phone)
-                    elif name == "escalate_to_human":
-                        db.mark_escalated(phone, datetime.now(timezone.utc))
-                        result = json.dumps({"escalated": True}, ensure_ascii=False)
-                    else:
-                        fn = TOOL_FNS.get(name)
-                        if fn is None:
-                            result = f"כלי לא ידוע: {name}"
+                    # Every tool_call MUST get a tool-result row, even on error —
+                    # otherwise the assistant tool_calls turn is orphaned and the
+                    # whole conversation 400s on every future replay.
+                    try:
+                        if name == "get_account_status":
+                            # Resolved from the conversation identity + DB, not the model args.
+                            result = _account_status_for(phone)
+                        elif name == "escalate_to_human":
+                            db.mark_escalated(phone, datetime.now(timezone.utc))
+                            result = json.dumps({"escalated": True}, ensure_ascii=False)
                         else:
-                            try:
+                            fn = TOOL_FNS.get(name)
+                            if fn is None:
+                                result = f"כלי לא ידוע: {name}"
+                            else:
                                 args = json.loads(tc.function.arguments or "{}")
                                 result = fn(**args)
-                            except (json.JSONDecodeError, TypeError) as e:
-                                result = f"שגיאה בהפעלת הכלי {name}: {e}"
+                    except Exception as e:
+                        print(
+                            f"[chat] tool {name} failed for {phone}: {type(e).__name__}: {e}",
+                            file=sys.stderr,
+                        )
+                        result = f"שגיאה זמנית בהפעלת הכלי {name}. המשך/י לעזור ללקוח בלי המידע הזה."
                     db.append_message(phone, "tool", tool_call_id=tc.id, content=result)
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
                 continue

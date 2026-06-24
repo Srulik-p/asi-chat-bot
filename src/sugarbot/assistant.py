@@ -78,6 +78,45 @@ def scrub_messages(messages: list[dict]) -> list[dict]:
     return out
 
 
+def repair_tool_calls(messages: list[dict]) -> list[dict]:
+    """Drop dangling tool-call references so the chat API doesn't 400.
+
+    The API requires every assistant `tool_call` to be answered by a `tool`
+    message with the same `tool_call_id`, and every `tool` message to answer a
+    preceding `tool_call`. A history persisted across an interruption — a tool
+    handler that raised, a client disconnect, or an instance kill between writing
+    the assistant turn and its tool results — can violate this and then 400s on
+    every replay. We rebuild a consistent list: keep only tool_calls that have a
+    matching tool response, and only tool messages that answer a kept tool_call.
+    A fully consistent history passes through unchanged.
+    """
+    responded = {
+        m.get("tool_call_id")
+        for m in messages
+        if m.get("role") == "tool" and m.get("tool_call_id")
+    }
+    out: list[dict] = []
+    kept_ids: set[str] = set()
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            kept = [tc for tc in m["tool_calls"] if tc.get("id") in responded]
+            if kept:
+                out.append({**m, "tool_calls": kept})
+                kept_ids.update(tc["id"] for tc in kept)
+            elif m.get("content"):
+                # No surviving tool_calls but there is text — keep as plain turn.
+                out.append({k: v for k, v in m.items() if k != "tool_calls"})
+            # else: tool-call-only assistant turn with no answers -> drop entirely
+        elif role == "tool":
+            if m.get("tool_call_id") in kept_ids:
+                out.append(m)
+            # else: orphan tool message -> drop
+        else:
+            out.append(m)
+    return out
+
+
 def empty_usage() -> dict:
     return {k: 0 for k in USAGE_KEYS}
 
