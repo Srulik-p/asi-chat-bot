@@ -96,4 +96,21 @@ clean = [
 assert repair_tool_calls(clean) == clean, repair_tool_calls(clean)
 print("5. consistent history -> unchanged")
 
+# 6) Interleaved history (a concurrent writer — e.g. the connected-push — landed
+# between the tool_call and its result) -> the tool message is moved back
+# adjacent to its assistant turn; the stray row survives, after the pair.
+interleaved = [
+    {"role": "user", "content": "סטטוס?"},
+    _assistant(["c9"]),
+    {"role": "assistant", "content": "התחברת בהצלחה 🙂"},
+    {"role": "tool", "tool_call_id": "c9", "content": "logged_in"},
+    {"role": "assistant", "content": "יש לך מנוי"},
+]
+fixed6 = repair_tool_calls(interleaved)
+idx = next(i for i, m in enumerate(fixed6) if m.get("tool_calls"))
+assert fixed6[idx + 1].get("role") == "tool" and fixed6[idx + 1]["tool_call_id"] == "c9", fixed6
+assert any(m.get("content") == "התחברת בהצלחה 🙂" for m in fixed6), fixed6
+assert any(m.get("content") == "יש לך מנוי" for m in fixed6), fixed6
+print("6. interleaved tool result -> moved adjacent to its assistant turn")
+
 print("\nALL CHECKS PASSED")

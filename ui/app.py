@@ -12,9 +12,16 @@ sidebar lets you switch numbers, which starts a fresh conversation.
 Env:
     CHAT_API_URL          backend base URL (default http://localhost:8000)
     INTERNAL_API_SECRET   shared secret for X-Internal-Secret header
+    UI_PASSWORD           staff password gating the whole UI. REQUIRED whenever
+                          the backend is not localhost — this surface can read,
+                          impersonate, and purge ANY customer's conversation by
+                          phone number, so it must never be reachable unauthenticated.
 """
 
+import base64
+import hmac
 import json
+import mimetypes
 import os
 import re
 import sys
@@ -27,6 +34,7 @@ load_dotenv()
 
 API_URL = os.getenv("CHAT_API_URL", "http://localhost:8000").rstrip("/")
 INTERNAL_SECRET = os.getenv("INTERNAL_API_SECRET", "")
+UI_PASSWORD = os.getenv("UI_PASSWORD", "")
 DEFAULT_PHONE = os.getenv("DEFAULT_TEST_PHONE", "0500000000")
 REQUEST_TIMEOUT = 120
 
@@ -74,6 +82,32 @@ st.markdown(
 
 st.title("שירות לקוחות שוגר דדי")
 st.caption(f"backend: {API_URL}")
+
+
+# ---------- staff auth gate ----------
+# This UI holds INTERNAL_API_SECRET and can read/impersonate/purge any
+# customer's conversation by phone number. Local dev against a localhost
+# backend is exempt; any other backend requires UI_PASSWORD.
+
+_LOCAL_BACKEND = API_URL.startswith(("http://localhost", "http://127.0.0.1"))
+
+if UI_PASSWORD:
+    if not st.session_state.get("ui_authed"):
+        with st.form("staff_gate"):
+            supplied = st.text_input("סיסמת צוות", type="password")
+            if st.form_submit_button("כניסה", use_container_width=True):
+                if hmac.compare_digest(supplied, UI_PASSWORD):
+                    st.session_state.ui_authed = True
+                    st.rerun()
+                else:
+                    st.error("סיסמה שגויה")
+        st.stop()
+elif not _LOCAL_BACKEND:
+    st.error(
+        "UI_PASSWORD אינו מוגדר. ממשק זה חושף נתוני לקוחות (קריאה, התחזות ומחיקה "
+        "לפי מספר טלפון) ולכן חסום עד שתוגדר סיסמת צוות בסביבה."
+    )
+    st.stop()
 
 
 # ---------- phone ----------
@@ -127,13 +161,23 @@ def purge_user(phone: str) -> dict:
     return r.json()
 
 
-def stream_assistant_reply(phone: str, message: str):
+def file_to_media(f) -> dict:
+    """Turn a Streamlit uploaded file into a backend media item (base64 data URL)."""
+    raw = f.getvalue() if hasattr(f, "getvalue") else f.read()
+    name = getattr(f, "name", "") or ""
+    mime = getattr(f, "type", None) or mimetypes.guess_type(name)[0] or "application/octet-stream"
+    data_url = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+    kind = "pdf" if mime == "application/pdf" or name.lower().endswith(".pdf") else "image"
+    return {"type": kind, "data_url": data_url, "filename": name or None}
+
+
+def stream_assistant_reply(phone: str, message: str, media: list[dict] | None = None):
     """Generator yielding plain-text deltas; stashes final usage in session_state."""
     st.session_state._last_usage = None
     try:
         with requests.post(
             f"{API_URL}/chat/message",
-            json={"phoneNumber": phone, "message": message},
+            json={"phoneNumber": phone, "message": message, "media": media or []},
             headers=_headers(),
             timeout=REQUEST_TIMEOUT,
             stream=True,
@@ -217,10 +261,11 @@ for msg in st.session_state.history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
+st.caption("אפשר לצרף תמונה או קובץ PDF (למשל צילום קבלה) עם אייקון המצורף 📎")
 chat_value = st.chat_input(
     "כתוב הודעה...",
     accept_file=True,
-    file_type=["png", "jpg", "jpeg"],
+    file_type=["png", "jpg", "jpeg", "pdf"],
 )
 if chat_value:
     phone = st.session_state.phone
@@ -235,21 +280,19 @@ if chat_value:
         if text:
             st.markdown(text)
         for f in files:
-            st.image(f)
+            if (getattr(f, "type", "") or "").startswith("image/"):
+                st.image(f)
+            else:
+                st.caption(f"📎 {getattr(f, 'name', 'קובץ')}")
 
-    # The backend chat API currently accepts text only. We flag attachments so
-    # the screenshot-based flows the bot asks for aren't silently dropped.
-    # Real image handling (store + show to a human rep / vision) is a follow-up.
-    if files:
-        note = "[המשתמש צירף תמונה/צילום מסך]"
-        outgoing = f"{text}\n{note}" if text else note
-    else:
-        outgoing = text
+    # Send the actual bytes to the backend as media; it attaches them to the
+    # model turn (vision) and persists only a light text placeholder in history.
+    media = [file_to_media(f) for f in files]
 
-    st.session_state.history.append({"role": "user", "content": text or "📎 תמונה"})
+    st.session_state.history.append({"role": "user", "content": text or "📎 קובץ"})
 
     with st.chat_message("assistant"):
-        full_text = st.write_stream(stream_assistant_reply(phone, outgoing))
+        full_text = st.write_stream(stream_assistant_reply(phone, text, media))
 
     st.session_state.history.append({"role": "assistant", "content": full_text or ""})
     last_usage = st.session_state.get("_last_usage")

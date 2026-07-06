@@ -11,6 +11,7 @@ assistant.scrub_messages for the model-facing redaction layer.
 from __future__ import annotations
 
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -37,8 +38,17 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 def _resolve_url() -> str:
     url = os.getenv("DATABASE_URL")
     if not url:
+        # The SQLite fallback is for LOCAL DEV ONLY. On Cloud Run it would boot
+        # green but write everything to the instance's ephemeral disk — chats
+        # split across instances and vanish on recycle — so refuse to start.
+        if os.getenv("K_SERVICE"):
+            raise RuntimeError(
+                "DATABASE_URL is required on Cloud Run: the SQLite fallback "
+                "writes to ephemeral disk and silently loses all data."
+            )
         path = Path(os.getenv("USERS_DB_PATH", "users.db"))
         path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[db] DATABASE_URL not set — using local SQLite at {path}", file=sys.stderr)
         return f"sqlite:///{path}"
     # Heroku-style `postgres://` is rejected by SQLAlchemy 1.4+; normalise.
     if url.startswith("postgres://"):
@@ -75,7 +85,12 @@ users_table = Table(
     Column("external_id", String, nullable=False),    # payload.user.id
     Column("nickname", String),                        # payload.user.nickname
     Column("is_premium", Boolean, nullable=False),     # payload.user.isPremium
+    Column("gender", String),                          # payload.user.gender — nullable; drives gender-aware answers
     Column("labels", JSON),                            # payload.user.labels — list[{id,name}]
+    # Always stored as "" — the callback's live site token is deliberately NOT
+    # persisted (nothing reads it, and a plaintext session token per customer is
+    # pure breach liability; see migration 0005). If a feature ever needs it,
+    # store it encrypted with a TTL.
     Column("access_token", String, nullable=False),
     Column("created_at", DateTime, nullable=False),
     Column("updated_at", DateTime, nullable=False),
@@ -130,15 +145,25 @@ def init_db() -> None:
     # One-time Alembic adoption. The original schema was created ad-hoc
     # (pre-Alembic) and predates the nickname/is_premium/labels columns, so it
     # has no alembic_version table. Migration 0001 would then hit "relation
-    # users already exists" and crash startup. Detect that exact state and drop
-    # the legacy tables so 0001 can recreate them cleanly. Guarded on the
-    # absence of alembic_version, so it runs at most once and never touches a
-    # DB that Alembic already manages.
+    # users already exists" and crash startup. That state also matches a
+    # restored backup that merely lost its alembic_version table, so the drop
+    # is destructive-by-default on an ambiguous signal — it therefore requires
+    # an explicit opt-in via SUGARBOT_ADOPT_LEGACY_DB=1 and otherwise refuses
+    # to start with instructions.
     with _engine.begin() as conn:
         tables = set(inspect(conn).get_table_names())
         if "alembic_version" not in tables and (tables & {"users", "messages"}):
+            if os.getenv("SUGARBOT_ADOPT_LEGACY_DB") != "1":
+                raise RuntimeError(
+                    "users/messages tables exist but alembic_version is missing. "
+                    "If this really is the legacy pre-Alembic schema, set "
+                    "SUGARBOT_ADOPT_LEGACY_DB=1 to DROP and recreate them; if the "
+                    "schema already matches head (e.g. a restored backup), run "
+                    "'alembic stamp head' instead. Refusing to drop data on an "
+                    "ambiguous signal."
+                )
             print(
-                "[init_db] legacy pre-Alembic schema detected; dropping users/messages "
+                "[init_db] SUGARBOT_ADOPT_LEGACY_DB=1: dropping legacy users/messages "
                 "so migration 0001 can recreate them",
                 file=sys.stderr,
             )
@@ -167,7 +192,7 @@ def upsert_user(
     nickname: Optional[str],
     is_premium: bool,
     labels: list[dict],
-    access_token: str,
+    gender: Optional[str] = None,
 ) -> None:
     # Timestamps set in Python so the INSERT always supplies them, regardless
     # of whether the table was created by an older schema without DEFAULTs.
@@ -178,8 +203,9 @@ def upsert_user(
         external_id=external_id,
         nickname=nickname,
         is_premium=is_premium,
+        gender=gender,
         labels=labels,
-        access_token=access_token,
+        access_token="",  # never persist the live token — see column comment
         created_at=now,
         updated_at=now,
     )
@@ -189,8 +215,9 @@ def upsert_user(
             "external_id": stmt.excluded.external_id,
             "nickname": stmt.excluded.nickname,
             "is_premium": stmt.excluded.is_premium,
+            "gender": stmt.excluded.gender,
             "labels": stmt.excluded.labels,
-            "access_token": stmt.excluded.access_token,
+            "access_token": stmt.excluded.access_token,  # "" — clears any legacy stored token
             "updated_at": stmt.excluded.updated_at,
         },
     )

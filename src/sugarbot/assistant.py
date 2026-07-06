@@ -36,7 +36,13 @@ MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 # the read_kb tool instead of carrying the full knowledge base every turn.
 SYSTEM_PROMPT = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8") + "\n\n" + kb.build_index()
 
-client = OpenAI()  # picks up OPENAI_API_KEY from env
+# Picks up OPENAI_API_KEY from env. Explicit per-request timeout: the SDK
+# default is 600s, and with the sync streaming loop each hung request pins a
+# server threadpool thread — a few of those and /healthz starts failing.
+client = OpenAI(
+    timeout=float(os.getenv("OPENAI_TIMEOUT_SECONDS", "120")),
+    max_retries=2,
+)
 
 TOOLS = kb.TOOLS
 TOOL_FNS = {"read_kb": kb.read_kb}
@@ -68,50 +74,76 @@ def redact_pii(text: str) -> str:
 
 
 def scrub_messages(messages: list[dict]) -> list[dict]:
-    """Return a new list with PII redacted from user-role text content."""
+    """Return a new list with PII redacted from user-role text content.
+
+    Handles both plain string content and multimodal content (a list of parts,
+    used when an image/PDF is attached): only the text parts are redacted; media
+    parts pass through untouched.
+    """
     out: list[dict] = []
     for m in messages:
-        if m.get("role") == "user" and isinstance(m.get("content"), str):
-            out.append({**m, "content": redact_pii(m["content"])})
+        if m.get("role") != "user":
+            out.append(m)
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            out.append({**m, "content": redact_pii(content)})
+        elif isinstance(content, list):
+            parts = [
+                {**p, "text": redact_pii(p["text"])}
+                if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str)
+                else p
+                for p in content
+            ]
+            out.append({**m, "content": parts})
         else:
             out.append(m)
     return out
 
 
 def repair_tool_calls(messages: list[dict]) -> list[dict]:
-    """Drop dangling tool-call references so the chat API doesn't 400.
+    """Repair tool-call structure so the chat API doesn't 400.
 
     The API requires every assistant `tool_call` to be answered by a `tool`
-    message with the same `tool_call_id`, and every `tool` message to answer a
-    preceding `tool_call`. A history persisted across an interruption — a tool
-    handler that raised, a client disconnect, or an instance kill between writing
-    the assistant turn and its tool results — can violate this and then 400s on
-    every replay. We rebuild a consistent list: keep only tool_calls that have a
-    matching tool response, and only tool messages that answer a kept tool_call.
+    message with the same `tool_call_id`, every `tool` message to answer a
+    tool_call, AND the tool messages to IMMEDIATELY follow the assistant turn
+    that requested them. A history persisted across an interruption — a tool
+    handler that raised, a client disconnect, or a concurrent writer landing a
+    row between the assistant turn and its tool results — can violate either
+    rule and then 400s on every replay. We rebuild a consistent list:
+
+    - keep only tool_calls that have a matching tool response, and only tool
+      messages that answer a kept tool_call;
+    - emit each kept tool message directly after its owning assistant turn,
+      healing interleavings (assistant(tool_calls) / stray row / tool) that a
+      keep/drop pass alone would leave poisoned.
+
     A fully consistent history passes through unchanged.
     """
-    responded = {
-        m.get("tool_call_id")
-        for m in messages
-        if m.get("role") == "tool" and m.get("tool_call_id")
-    }
+    # First tool response per id wins; duplicates and orphans are dropped.
+    tool_msgs: dict[str, dict] = {}
+    for m in messages:
+        cid = m.get("tool_call_id")
+        if m.get("role") == "tool" and cid and cid not in tool_msgs:
+            tool_msgs[cid] = m
+
     out: list[dict] = []
-    kept_ids: set[str] = set()
     for m in messages:
         role = m.get("role")
         if role == "assistant" and m.get("tool_calls"):
-            kept = [tc for tc in m["tool_calls"] if tc.get("id") in responded]
+            kept = [tc for tc in m["tool_calls"] if tc.get("id") in tool_msgs]
             if kept:
                 out.append({**m, "tool_calls": kept})
-                kept_ids.update(tc["id"] for tc in kept)
+                # Answers must be adjacent — emit them here, not where they
+                # happened to be stored.
+                out.extend(tool_msgs[tc["id"]] for tc in kept)
             elif m.get("content"):
                 # No surviving tool_calls but there is text — keep as plain turn.
                 out.append({k: v for k, v in m.items() if k != "tool_calls"})
             # else: tool-call-only assistant turn with no answers -> drop entirely
         elif role == "tool":
-            if m.get("tool_call_id") in kept_ids:
-                out.append(m)
-            # else: orphan tool message -> drop
+            # Already emitted next to its assistant turn (or an orphan) — skip.
+            continue
         else:
             out.append(m)
     return out

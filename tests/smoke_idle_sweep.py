@@ -67,7 +67,7 @@ db.mark_escalated(esc, now)
 # False) the sweep must NOT advance state — never close an inquiry the customer
 # was never warned about. Escalated/fresh convos are excluded, so scanned == 1.
 res = server._sweep_idle()
-assert res == {"scanned": 1, "warned": 0, "closed": 0}, res
+assert res == {"scanned": 1, "warned": 0, "closed": 0, "truncated": False}, res
 assert db.get_conversation_state(idle) is None, "failed delivery must not warn"
 print("0. failed delivery -> no state advance:", res)
 
@@ -128,7 +128,7 @@ assert (
 )
 r = client.post("/maintenance/sweep-idle", headers={"X-Internal-Secret": "smoke-internal"})
 assert r.status_code == 200, (r.status_code, r.text)
-assert set(r.json()) == {"scanned", "warned", "closed"}, r.json()
+assert set(r.json()) == {"scanned", "warned", "closed", "truncated"}, r.json()
 print("5. endpoint secret guard ok:", r.json())
 
 print("\nALL CHECKS PASSED")
