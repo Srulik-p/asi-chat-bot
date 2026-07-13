@@ -76,7 +76,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from sugarbot import db, notifier
+from sugarbot import contact, db, notifier
 from sugarbot.assistant import (
     MAX_TOOL_ROUNDS,
     MODEL,
@@ -394,7 +394,63 @@ ACCOUNT_TOOLS = [
     },
 ]
 
-TOOLS_ALL = TOOLS + ACCOUNT_TOOLS
+# ---------- support-ticket tool ----------
+# Files a ticket into the site's help-desk system (the same backend the public
+# "contact us" form posts to), so the bot can open a ticket on the customer's
+# behalf. Defined here, like the account tools, because the customer's phone is
+# resolved from the conversation identity (as sourcePhoneNumber) and never
+# passed by the model. The model supplies only the reason and a summary.
+
+CONTACT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_support_ticket",
+            "description": (
+                "Open an official support ticket in the site's help desk on the "
+                "customer's behalf — the same queue the human team works from. Use "
+                "this ONLY after you have understood the customer's issue and, for "
+                "irreversible actions (e.g. account removal), the customer has "
+                "explicitly confirmed. Do NOT use it for questions you can answer "
+                "yourself from the knowledge base. Provide `reason` (the closest "
+                "category) and `text` (a clear Hebrew summary of the issue, "
+                "including any detail the team needs). Include `email` only if the "
+                "customer gave one. The customer's phone is attached automatically "
+                "from the conversation — never ask for it or pass it. After a "
+                "successful submit, tell the customer the ticket was sent to the "
+                "team and they will reply during working hours."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "enum": contact.REASON_CHOICES,
+                        "description": (
+                            "Ticket category: login_email (can't sign in with their "
+                            "email), help_desk (talk to a rep), forgot_password, "
+                            "technical (a bug/error on the site), remove_account "
+                            "(delete their account), report (report a user/abuse), "
+                            "other."
+                        ),
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Hebrew summary of the customer's issue for the team.",
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": "Customer email, only if they provided one. Optional.",
+                    },
+                },
+                "required": ["reason", "text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+TOOLS_ALL = TOOLS + ACCOUNT_TOOLS + CONTACT_TOOLS
 
 
 def _login_is_stale(user: dict) -> bool:
@@ -610,6 +666,41 @@ def _run_chat_locked(
                         elif name == "escalate_to_human":
                             db.mark_escalated(phone, datetime.now(timezone.utc))
                             result = json.dumps({"escalated": True}, ensure_ascii=False)
+                        elif name == "submit_support_ticket":
+                            # phone comes from the conversation identity (kept out
+                            # of the model), attached as sourcePhoneNumber.
+                            args = json.loads(tc.function.arguments or "{}")
+                            res = contact.submit_ticket(
+                                reason=args.get("reason", ""),
+                                text=args.get("text", ""),
+                                source_email=args.get("email") or None,
+                                source_phone=phone,
+                            )
+                            if res["ok"]:
+                                result = json.dumps(
+                                    {
+                                        "submitted": True,
+                                        "instructions": (
+                                            "הפנייה נפתחה במערכת התמיכה. עדכן/י את הלקוח "
+                                            "בקצרה שהפנייה נשלחה לצוות ושיחזרו אליו בשעות "
+                                            "הפעילות (א'-ה' 9:00-17:00). אל תבטיח/י זמן "
+                                            "מדויק מעבר לזה."
+                                        ),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            else:
+                                result = json.dumps(
+                                    {
+                                        "submitted": False,
+                                        "instructions": (
+                                            "פתיחת הפנייה נכשלה. אל תגיד/י ללקוח שנפתחה "
+                                            "פנייה. הצע/י לנסות שוב בעוד רגע, ואם דחוף - "
+                                            "העבר/י לנציג (escalate_to_human)."
+                                        ),
+                                    },
+                                    ensure_ascii=False,
+                                )
                         else:
                             fn = TOOL_FNS.get(name)
                             if fn is None:
