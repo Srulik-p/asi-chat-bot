@@ -126,6 +126,23 @@ conversation_state_table = Table(
 )
 
 
+# Help-desk tickets opened for a conversation (via contact.submit_ticket).
+# Keyed by phone_number so later turns can surface an open ticket as context.
+# ticket_id/status come from the backend response; `raw` keeps the full body
+# because the backend's exact response shape is not documented.
+support_tickets_table = Table(
+    "support_tickets",
+    _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("phone_number", String, nullable=False, index=True),
+    Column("ticket_id", String),   # id returned by the help desk (may be None)
+    Column("status", String),      # status returned by the help desk (or "created")
+    Column("reason", String),      # reason key the ticket was filed under
+    Column("raw", JSON),           # full response body, for later shape refinement
+    Column("created_at", DateTime, nullable=False),
+)
+
+
 def init_db() -> None:
     """Bring the DB schema up to the latest Alembic revision.
 
@@ -290,9 +307,10 @@ def clear_history(phone_number: str) -> int:
 
 def delete_user_data(phone_number: str) -> dict:
     """Erase everything stored for a phone number: chat history, the cached
-    login row (nickname/labels/access token), and conversation lifecycle state.
+    login row (nickname/labels/access token), conversation lifecycle state, and
+    any support tickets filed for the conversation.
 
-    Atomic — all three deletes share one transaction. Returns the per-table row
+    Atomic — all deletes share one transaction. Returns the per-table row
     counts removed.
     """
     with _engine.begin() as conn:
@@ -307,7 +325,17 @@ def delete_user_data(phone_number: str) -> dict:
                 conversation_state_table.c.phone_number == phone_number
             )
         ).rowcount or 0
-    return {"messages": messages, "user": user, "conversation_state": state}
+        tickets = conn.execute(
+            delete(support_tickets_table).where(
+                support_tickets_table.c.phone_number == phone_number
+            )
+        ).rowcount or 0
+    return {
+        "messages": messages,
+        "user": user,
+        "conversation_state": state,
+        "support_tickets": tickets,
+    }
 
 
 # ---------- inactivity auto-close ----------
@@ -414,3 +442,52 @@ def get_conversation_state(phone_number: str) -> Optional[dict]:
         "closed_at": _as_utc(row["closed_at"]),
         "escalated_at": _as_utc(row["escalated_at"]),
     }
+
+
+# ---------- help-desk tickets ----------
+
+def add_support_ticket(
+    phone_number: str,
+    ticket_id: Optional[str],
+    status: Optional[str],
+    reason: Optional[str],
+    raw: Optional[object] = None,
+) -> int:
+    """Persist a filed support ticket. Returns the new row's local id."""
+    with _engine.begin() as conn:
+        result = conn.execute(
+            support_tickets_table.insert().values(
+                phone_number=phone_number,
+                ticket_id=ticket_id,
+                status=status,
+                reason=reason,
+                raw=raw,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+    pk = result.inserted_primary_key
+    return pk[0] if pk else 0
+
+
+def recent_support_tickets(
+    phone_number: str, since: Optional[datetime] = None, limit: int = 5
+) -> list[dict]:
+    """Most-recent-first tickets for a phone, optionally only those since `since`."""
+    stmt = select(support_tickets_table).where(
+        support_tickets_table.c.phone_number == phone_number
+    )
+    if since is not None:
+        stmt = stmt.where(support_tickets_table.c.created_at >= since)
+    stmt = stmt.order_by(support_tickets_table.c.id.desc()).limit(limit)
+    with _engine.connect() as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [
+        {
+            "id": r["id"],
+            "ticket_id": r["ticket_id"],
+            "status": r["status"],
+            "reason": r["reason"],
+            "created_at": _as_utc(r["created_at"]),
+        }
+        for r in rows
+    ]
