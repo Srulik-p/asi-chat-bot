@@ -407,18 +407,23 @@ CONTACT_TOOLS = [
         "function": {
             "name": "submit_support_ticket",
             "description": (
-                "Open an official support ticket in the site's help desk on the "
-                "customer's behalf — the same queue the human team works from. Use "
-                "this ONLY after you have understood the customer's issue and, for "
-                "irreversible actions (e.g. account removal), the customer has "
-                "explicitly confirmed. Do NOT use it for questions you can answer "
-                "yourself from the knowledge base. Provide `reason` (the closest "
-                "category) and `text` (a clear Hebrew summary of the issue, "
-                "including any detail the team needs). Include `email` only if the "
-                "customer gave one. The customer's phone is attached automatically "
-                "from the conversation — never ask for it or pass it. After a "
-                "successful submit, tell the customer the ticket was sent to the "
-                "team and they will reply during working hours."
+                "Open a support ticket in the site's help desk on the customer's "
+                "behalf — the same queue the human team works from. This is how you "
+                "hand the conversation to a human: call it WHENEVER the customer asks "
+                "for a human representative, OR the situation needs one (refund, "
+                "billing dispute, blocked-account appeal, serious report, unresolved "
+                "technical issue, emotional distress, manual actions). Use "
+                "reason='help_desk' for a plain 'I want to talk to a rep' request, "
+                "otherwise the closest category. Pair it with escalate_to_human "
+                "(which marks the conversation awaiting a rep). Do NOT use it for "
+                "questions you can answer yourself from the knowledge base, and for "
+                "irreversible actions (e.g. account removal) only after the customer "
+                "has explicitly confirmed. Provide `text` (a clear Hebrew summary of "
+                "what the customer needs, with any detail the team needs); include "
+                "`email` only if the customer gave one. The customer's phone is "
+                "attached automatically from the conversation — never ask for it or "
+                "pass it. After a successful submit, tell the customer a human "
+                "representative will get back to them during working hours."
             ),
             "parameters": {
                 "type": "object",
@@ -682,9 +687,9 @@ def _run_chat_locked(
                                         "submitted": True,
                                         "instructions": (
                                             "הפנייה נפתחה במערכת התמיכה. עדכן/י את הלקוח "
-                                            "בקצרה שהפנייה נשלחה לצוות ושיחזרו אליו בשעות "
-                                            "הפעילות (א'-ה' 9:00-17:00). אל תבטיח/י זמן "
-                                            "מדויק מעבר לזה."
+                                            "בקצרה שהפנייה נשלחה ושנציג אנושי יחזור אליו "
+                                            "בשעות הפעילות (א'-ה' 9:00-17:00). אל תבטיח/י "
+                                            "זמן מדויק מעבר לזה."
                                         ),
                                     },
                                     ensure_ascii=False,
