@@ -90,6 +90,63 @@ def resolve_reason(reason: str) -> str | None:
     return None
 
 
+# The backend's response shape for a created ticket is not documented, so we
+# probe common id/status key names at the top level and inside a few common
+# wrapper objects. The full body is kept (raw) so the real shape can be
+# inspected in the DB and these lists refined.
+_ID_KEYS = (
+    "id", "ticketId", "ticketID", "ticket_id", "_id",
+    "ticketNumber", "ticketNo", "number", "uuid",
+)
+_STATUS_KEYS = ("status", "state", "ticketStatus")
+_CONTAINERS = ("data", "ticket", "result", "payload")
+
+
+def _first_key(d: dict, keys) -> str | None:
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, ""):
+            return str(v)
+    return None
+
+
+def _extract_ticket_fields(resp) -> tuple[str | None, str | None, object]:
+    """Best-effort (ticket_id, status, raw_body) from a support response."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return None, None, None
+    if not isinstance(body, dict):
+        return None, None, body
+    ticket_id = _first_key(body, _ID_KEYS)
+    status = _first_key(body, _STATUS_KEYS)
+    for container in _CONTAINERS:
+        inner = body.get(container)
+        if isinstance(inner, dict):
+            ticket_id = ticket_id or _first_key(inner, _ID_KEYS)
+            status = status or _first_key(inner, _STATUS_KEYS)
+    return ticket_id, status, body
+
+
+def _result(
+    ok: bool,
+    *,
+    http_status: int | None = None,
+    ticket_id: str | None = None,
+    ticket_status: str | None = None,
+    detail: str = "",
+    raw: object = None,
+) -> dict:
+    return {
+        "ok": ok,
+        "http_status": http_status,
+        "ticket_id": ticket_id,
+        "ticket_status": ticket_status,
+        "detail": detail,
+        "raw": raw,
+    }
+
+
 def submit_ticket(
     reason: str,
     text: str,
@@ -105,16 +162,19 @@ def submit_ticket(
     (filename, fileobj_or_bytes, content_type).
 
     Result dict shape:
-        {"ok": bool, "status": int | None, "detail": str}
-    A missing SUPPORT_TICKET_URL or an unknown reason is a handled failure
-    (ok=False), so callers (the tool dispatcher) never crash the chat turn.
+        {"ok": bool, "http_status": int | None, "ticket_id": str | None,
+         "ticket_status": str | None, "detail": str, "raw": object}
+    On success ticket_id/ticket_status are parsed from the response body
+    (ticket_status falls back to "created" when the body omits one). A missing
+    SUPPORT_TICKET_URL or an unknown reason is a handled failure (ok=False), so
+    callers (the tool dispatcher) never crash the chat turn.
     """
     if not SUPPORT_TICKET_URL:
-        return {"ok": False, "status": None, "detail": "SUPPORT_TICKET_URL not set"}
+        return _result(False, detail="SUPPORT_TICKET_URL not set")
 
     reason_id = resolve_reason(reason)
     if reason_id is None:
-        return {"ok": False, "status": None, "detail": f"unknown reason: {reason}"}
+        return _result(False, detail=f"unknown reason: {reason}")
 
     # Send as multipart/form-data (what the web form uses). Passing every field
     # through `files` as (None, value) makes requests encode plain form fields
@@ -144,9 +204,19 @@ def submit_ticket(
         )
     except requests.RequestException as e:
         print(f"[contact] support ticket failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return {"ok": False, "status": None, "detail": f"{type(e).__name__}: {e}"}
+        return _result(False, detail=f"{type(e).__name__}: {e}")
 
-    ok = resp.ok
-    if not ok:
+    if not resp.ok:
         print(f"[contact] support ticket HTTP {resp.status_code}", file=sys.stderr)
-    return {"ok": ok, "status": resp.status_code, "detail": "created" if ok else resp.reason}
+        return _result(False, http_status=resp.status_code, detail=resp.reason)
+
+    ticket_id, status, raw = _extract_ticket_fields(resp)
+    # Always store a status; fall back to "created" when the body omits one.
+    return _result(
+        True,
+        http_status=resp.status_code,
+        ticket_id=ticket_id,
+        ticket_status=status or "created",
+        detail="created",
+        raw=raw,
+    )

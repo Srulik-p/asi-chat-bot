@@ -127,6 +127,11 @@ INACTIVITY_SWEEP_DEADLINE_SECONDS = int(os.getenv("INACTIVITY_SWEEP_DEADLINE_SEC
 # context_length_exceeded failure. repair_tool_calls heals any tool pair the
 # slice boundary cuts.
 HISTORY_MAX_MESSAGES = int(os.getenv("HISTORY_MAX_MESSAGES", "80"))
+# How far back a filed support ticket is surfaced to the model as open-ticket
+# context on later turns (so it can quote the ticket number / status and avoid
+# filing a duplicate). We never poll the backend for status updates, so this is
+# a freshness window, not a real "still open" check.
+TICKET_CONTEXT_DAYS = int(os.getenv("TICKET_CONTEXT_DAYS", "14"))
 # Size of the anyio threadpool that drives sync endpoints + the streaming chat
 # generator. The default (40) means ~40 concurrent conversations exhaust the
 # pool and /auth/callback starts queueing behind chats.
@@ -526,6 +531,30 @@ def _account_status_for(phone: str) -> str:
     )
 
 
+def _open_ticket_note(phone: str) -> str | None:
+    """A system note listing recent support tickets for this conversation, so the
+    model can quote the ticket number/status and not open a duplicate. Returns
+    None when there is nothing recent to surface. The phone stays out of the
+    note — only the (non-PII) ticket id/status/reason are included."""
+    since = datetime.now(timezone.utc) - timedelta(days=TICKET_CONTEXT_DAYS)
+    tickets = db.recent_support_tickets(phone, since=since, limit=3)
+    if not tickets:
+        return None
+    lines = []
+    for t in tickets:
+        tid = t["ticket_id"] or "לא זמין"
+        status = t["status"] or "נשלחה"
+        when = t["created_at"].strftime("%Y-%m-%d") if t["created_at"] else ""
+        lines.append(f"- פנייה {tid} (סטטוס: {status}, נושא: {t['reason']}, נפתחה: {when})")
+    return (
+        "הערת מערכת - פניות תמיכה שנפתחו ללקוח לאחרונה:\n"
+        + "\n".join(lines)
+        + "\nאם הלקוח שואל על סטטוס הפנייה - התייחס/י למספר ולסטטוס. "
+        "אל תפתח/י פנייה כפולה על אותו נושא; אם כבר יש פנייה פתוחה בנושא, "
+        "הזכר/י בעדינות שהיא כבר אצל הצוות."
+    )
+
+
 def _media_content_parts(media: list["MediaItem"]) -> list[dict]:
     """Turn inbound attachments into OpenAI multimodal content parts."""
     parts: list[dict] = []
@@ -605,6 +634,13 @@ def _run_chat_locked(
     # single poisoned turn can't 400 the conversation forever.
     messages = repair_tool_calls(messages)
 
+    # Surface any recently-filed support ticket as context. Inserted right after
+    # the cached system prompt (index 0) so the static prefix still caches; this
+    # extra system note is small and intentionally not cached.
+    ticket_note = _open_ticket_note(phone)
+    if ticket_note:
+        messages.insert(1, {"role": "system", "content": ticket_note})
+
     total = empty_usage()
     # Safety-net for Remark 12 ("login link often not sent"): whenever
     # get_account_status resolves to a not-logged-in status with a login_url, we
@@ -682,14 +718,25 @@ def _run_chat_locked(
                                 source_phone=phone,
                             )
                             if res["ok"]:
+                                # Persist so later turns can surface it as context.
+                                db.add_support_ticket(
+                                    phone,
+                                    ticket_id=res.get("ticket_id"),
+                                    status=res.get("ticket_status"),
+                                    reason=args.get("reason", ""),
+                                    raw=res.get("raw"),
+                                )
                                 result = json.dumps(
                                     {
                                         "submitted": True,
+                                        "ticket_id": res.get("ticket_id"),
+                                        "status": res.get("ticket_status"),
                                         "instructions": (
                                             "הפנייה נפתחה במערכת התמיכה. עדכן/י את הלקוח "
                                             "בקצרה שהפנייה נשלחה ושנציג אנושי יחזור אליו "
-                                            "בשעות הפעילות (א'-ה' 9:00-17:00). אל תבטיח/י "
-                                            "זמן מדויק מעבר לזה."
+                                            "בשעות הפעילות (א'-ה' 9:00-17:00). אם יש "
+                                            "ticket_id - מסור/י ללקוח את מספר הפנייה. "
+                                            "אל תבטיח/י זמן מדויק מעבר לזה."
                                         ),
                                     },
                                     ensure_ascii=False,

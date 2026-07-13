@@ -108,7 +108,7 @@ r = client.post(
     "/user/delete", json={"phoneNumber": phone}, headers={"X-Internal-Secret": "smoke-internal"}
 )
 assert r.status_code == 200, (r.status_code, r.text)
-assert r.json() == {"messages": 2, "user": 1, "conversation_state": 1}, r.json()
+assert r.json() == {"messages": 2, "user": 1, "conversation_state": 1, "support_tickets": 0}, r.json()
 assert db.get_user_by_phone(phone) is None, "user row should be gone"
 assert db.load_history(phone) == [], "history should be gone"
 assert db.get_conversation_state(phone) is None, "conversation state should be gone"
