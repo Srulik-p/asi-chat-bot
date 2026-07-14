@@ -5,13 +5,20 @@ backend the public contact form (https://sugardaddy.co.il/he/contact-us)
 posts to. Lets the assistant open a ticket on the customer's behalf instead
 of telling them to go fill the web form themselves.
 
-The form posts `multipart/form-data` to the "unauth" support endpoint. The
-contract is configured by env so the exact endpoint / headers live in one
-place:
-  SUPPORT_TICKET_URL       full URL to POST to
-                           (default: the site's unauth support endpoint)
-  SUPPORT_TICKET_ORIGIN    Origin header the backend expects
-  SUPPORT_TICKET_REFERER   Referer header the backend expects
+The form posts `multipart/form-data` to the "unauth" support endpoint.
+
+The help desk exists in two environments, selected by SUPPORT_TICKET_ENV
+("qa" — the default — or "prod"). The environment picks the backend host,
+the Origin/Referer headers, AND the ContactUsReason optionIds — QA and prod
+are separate databases, so the same reason has a *different* UUID in each.
+Until launch tickets go to QA only; flip SUPPORT_TICKET_ENV=prod to go live.
+
+Env configuration (all optional):
+  SUPPORT_TICKET_ENV       "qa" (default) or "prod" — selects endpoint,
+                           headers and reason-id map as one consistent set
+  SUPPORT_TICKET_URL       override the full URL to POST to
+  SUPPORT_TICKET_ORIGIN    override the Origin header
+  SUPPORT_TICKET_REFERER   override the Referer header
   SUPPORT_TICKET_TIMEOUT   request timeout in seconds (default 10)
 
 Multipart fields posted (mirrors the site frontend's FormData):
@@ -24,8 +31,9 @@ Multipart fields posted (mirrors the site frontend's FormData):
 `reason` must be an *optionId* (a UUID), not a free-text label. The known
 ContactUsReason optionIds are mapped below from stable friendly keys, so the
 model picks a semantic key (e.g. "technical") and we resolve the UUID here.
-The authoritative list is GET /user/option/all -> ContactUsReason; if the
-site rotates these ids, update REASON_IDS (or pass a raw UUID as `reason`).
+The authoritative list is GET <backend>/user/option/all -> ContactUsReason
+(per environment); if the site rotates these ids, update REASON_IDS_BY_ENV
+(or pass a raw UUID as `reason`).
 """
 
 from __future__ import annotations
@@ -35,29 +43,67 @@ import sys
 
 import requests
 
-SUPPORT_TICKET_URL = os.getenv(
-    "SUPPORT_TICKET_URL", "https://cl-backend.sugarinter.media/user/support/unauth"
+SUPPORT_TICKET_ENV = os.getenv("SUPPORT_TICKET_ENV", "qa").strip().lower()
+if SUPPORT_TICKET_ENV not in ("qa", "prod"):
+    print(
+        f"[contact] unknown SUPPORT_TICKET_ENV {SUPPORT_TICKET_ENV!r}; falling back to qa",
+        file=sys.stderr,
+    )
+    SUPPORT_TICKET_ENV = "qa"
+
+_ENV_DEFAULTS = {
+    "qa": {
+        "url": "https://backend-clients.sugarinter.media/user/support/unauth",
+        "origin": "https://qa.sugardaddy.co.il",
+        "referer": "https://qa.sugardaddy.co.il/he/contact-us",
+    },
+    "prod": {
+        "url": "https://cl-backend.sugarinter.media/user/support/unauth",
+        "origin": "https://sugardaddy.co.il",
+        "referer": "https://sugardaddy.co.il/he/contact-us",
+    },
+}
+
+SUPPORT_TICKET_URL = os.getenv("SUPPORT_TICKET_URL", _ENV_DEFAULTS[SUPPORT_TICKET_ENV]["url"])
+SUPPORT_TICKET_ORIGIN = os.getenv(
+    "SUPPORT_TICKET_ORIGIN", _ENV_DEFAULTS[SUPPORT_TICKET_ENV]["origin"]
 )
-SUPPORT_TICKET_ORIGIN = os.getenv("SUPPORT_TICKET_ORIGIN", "https://sugardaddy.co.il")
 SUPPORT_TICKET_REFERER = os.getenv(
-    "SUPPORT_TICKET_REFERER", "https://sugardaddy.co.il/he/contact-us"
+    "SUPPORT_TICKET_REFERER", _ENV_DEFAULTS[SUPPORT_TICKET_ENV]["referer"]
 )
 SUPPORT_TICKET_TIMEOUT = float(os.getenv("SUPPORT_TICKET_TIMEOUT", "10"))
 
-# Friendly, stable key -> ContactUsReason optionId. Keys are what the model
-# passes; the UUIDs are what the backend requires. The first six mirror the
-# reason buttons on the web form; `report` / `admin_declined` are extra
-# reasons the backend accepts but the form does not surface as buttons.
-REASON_IDS = {
-    "login_email": "4e2f8c6f-5a9b-4cf4-bf9f-b5b21d3bacbe",       # לא מצליח להתחבר עם המייל שלי
-    "help_desk": "4174349b-a7d5-4986-8a57-8dd8399ac334",         # שיחה עם נציג שירות לקוחות
-    "forgot_password": "7d417f68-8554-4ec3-8209-5f846a5282e8",   # שכחתי סיסמה
-    "technical": "1c366a67-dc37-4df8-8ae8-3ab07595a5c8",         # בעיה טכנית
-    "remove_account": "bff68c44-0d71-47ab-b3c8-538c6b71aafc",    # הסר את החשבון שלי
-    "other": "87f9f0c7-109f-4d76-9162-125b606bdf6a",             # אחר
-    "report": "3e6ca411-22bb-4869-b367-4685b2c06bb6",            # דיווח
-    "admin_declined": "e5e0d6b6-2108-4a93-93fb-125b4a7a6b97",    # admin declined
+# Friendly, stable key -> ContactUsReason optionId, per environment. Keys are
+# what the model passes; the UUIDs are what the backend requires. QA and prod
+# are separate databases — the same reason has a different optionId in each
+# (both maps snapshotted from GET <backend>/user/option/all on 2026-07-14).
+# The first six mirror the reason buttons on the web form; `report` /
+# `admin_declined` are extra reasons the backend accepts but the form does
+# not surface as buttons.
+REASON_IDS_BY_ENV = {
+    "qa": {
+        "login_email": "7fab31ea-c7c0-488a-ad76-06363753fa0c",       # לא מצליח להתחבר עם המייל שלי
+        "help_desk": "e8c0b387-6f3d-48e4-9cfa-20d1f35bb701",         # שיחה עם נציג שירות לקוחות
+        "forgot_password": "0866af52-67e2-4d57-86c0-28bc19078e52",   # שכחתי סיסמה
+        "technical": "8ddc112a-e53a-4236-a9be-7f7f1db729ba",         # בעיה טכנית
+        "remove_account": "8cdfdc39-1b26-4ba3-89bb-92407c84e11f",    # הסר את החשבון שלי
+        "other": "e3735ae8-8ec5-451d-9a4e-cf06b6c75ae0",             # אחר
+        "report": "1dadbff9-e64c-450b-b63f-27ef76238b47",            # דיווח
+        "admin_declined": "ea78e71e-6f01-40a3-a94a-149d80203f34",    # admin declined
+    },
+    "prod": {
+        "login_email": "4e2f8c6f-5a9b-4cf4-bf9f-b5b21d3bacbe",       # לא מצליח להתחבר עם המייל שלי
+        "help_desk": "4174349b-a7d5-4986-8a57-8dd8399ac334",         # שיחה עם נציג שירות לקוחות
+        "forgot_password": "7d417f68-8554-4ec3-8209-5f846a5282e8",   # שכחתי סיסמה
+        "technical": "1c366a67-dc37-4df8-8ae8-3ab07595a5c8",         # בעיה טכנית
+        "remove_account": "bff68c44-0d71-47ab-b3c8-538c6b71aafc",    # הסר את החשבון שלי
+        "other": "87f9f0c7-109f-4d76-9162-125b606bdf6a",             # אחר
+        "report": "3e6ca411-22bb-4869-b367-4685b2c06bb6",            # דיווח
+        "admin_declined": "e5e0d6b6-2108-4a93-93fb-125b4a7a6b97",    # admin declined
+    },
 }
+
+REASON_IDS = REASON_IDS_BY_ENV[SUPPORT_TICKET_ENV]
 
 # The reason keys the assistant is allowed to choose (surfaced in the tool
 # schema). `admin_declined` is intentionally excluded — it is an internal
