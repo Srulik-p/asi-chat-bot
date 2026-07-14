@@ -417,7 +417,9 @@ CONTACT_TOOLS = [
                 "hand the conversation to a human: call it WHENEVER the customer asks "
                 "for a human representative, OR the situation needs one (refund, "
                 "billing dispute, blocked-account appeal, serious report, unresolved "
-                "technical issue, emotional distress, manual actions). Use "
+                "technical issue, emotional distress, manual actions), OR you are "
+                "stuck (no answer in the knowledge base / could not resolve) and the "
+                "customer accepted your offer to open a ticket. Use "
                 "reason='help_desk' for a plain 'I want to talk to a rep' request, "
                 "otherwise the closest category. Pair it with escalate_to_human "
                 "(which marks the conversation awaiting a rep). Do NOT use it for "
@@ -719,13 +721,23 @@ def _run_chat_locked(
                             )
                             if res["ok"]:
                                 # Persist so later turns can surface it as context.
-                                db.add_support_ticket(
-                                    phone,
-                                    ticket_id=res.get("ticket_id"),
-                                    status=res.get("ticket_status"),
-                                    reason=args.get("reason", ""),
-                                    raw=res.get("raw"),
-                                )
+                                # The ticket already exists in the help desk, so a
+                                # persistence failure must not surface as a failed
+                                # submit — the model would retry and file a duplicate.
+                                try:
+                                    db.add_support_ticket(
+                                        phone,
+                                        ticket_id=res.get("ticket_id"),
+                                        status=res.get("ticket_status"),
+                                        reason=args.get("reason", ""),
+                                        raw=res.get("raw"),
+                                    )
+                                except Exception as persist_err:
+                                    print(
+                                        f"[chat] support-ticket context save failed for {phone}: "
+                                        f"{type(persist_err).__name__}: {persist_err}",
+                                        file=sys.stderr,
+                                    )
                                 result = json.dumps(
                                     {
                                         "submitted": True,
