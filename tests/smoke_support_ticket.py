@@ -20,6 +20,7 @@ pathlib.Path(DB_PATH).unlink(missing_ok=True)
 os.environ["DATABASE_URL"] = ""
 os.environ["USERS_DB_PATH"] = DB_PATH
 os.environ["OPENAI_API_KEY"] = "dummy-for-smoke-test"
+os.environ.pop("SUPPORT_TICKET_ENV", None)  # exercise the default (qa)
 
 from sugarbot import contact  # noqa: E402
 
@@ -50,14 +51,30 @@ def _fake_post(url, files=None, headers=None, timeout=None):
 contact.requests.post = _fake_post
 contact.SUPPORT_TICKET_URL = "https://backend.example/user/support/unauth"
 
-# 1) reason key -> optionId; raw UUID passes through; junk -> None
-assert contact.resolve_reason("technical") == "1c366a67-dc37-4df8-8ae8-3ab07595a5c8"
-assert contact.resolve_reason("remove_account") == "bff68c44-0d71-47ab-b3c8-538c6b71aafc"
+# 1) env profiles: default is QA (no prod domain until launch), each env maps
+#    every choosable reason to its own optionId, and QA != prod (separate DBs)
+assert contact.SUPPORT_TICKET_ENV == "qa", contact.SUPPORT_TICKET_ENV
+assert contact.REASON_IDS is contact.REASON_IDS_BY_ENV["qa"]
+assert contact.SUPPORT_TICKET_ORIGIN == "https://qa.sugardaddy.co.il", contact.SUPPORT_TICKET_ORIGIN
+assert (
+    contact._ENV_DEFAULTS["qa"]["url"] != contact._ENV_DEFAULTS["prod"]["url"]
+), "qa and prod must post to different backends"
+for env, ids in contact.REASON_IDS_BY_ENV.items():
+    missing = set(contact.REASON_CHOICES) - set(ids)
+    assert not missing, f"{env} map missing reasons: {missing}"
+for key in contact.REASON_CHOICES:
+    assert (
+        contact.REASON_IDS_BY_ENV["qa"][key] != contact.REASON_IDS_BY_ENV["prod"][key]
+    ), f"qa/prod optionId for {key} must differ (separate databases)"
+
+# reason key -> optionId; raw UUID passes through; junk -> None
+assert contact.resolve_reason("technical") == "8ddc112a-e53a-4236-a9be-7f7f1db729ba"
+assert contact.resolve_reason("remove_account") == "8cdfdc39-1b26-4ba3-89bb-92407c84e11f"
 raw = "12345678-1234-1234-1234-123456789abc"
 assert contact.resolve_reason(raw) == raw, "raw optionId should pass through"
 assert contact.resolve_reason("not-a-reason") is None
 assert contact.resolve_reason("") is None
-print("1. resolve_reason: key->id, raw uuid passthrough, junk->None")
+print("1. env profiles (qa default, qa!=prod); resolve_reason: key->id, raw uuid, junk->None")
 
 # 2) successful submit builds the right multipart fields + headers, and parses
 #    ticket_id/status from the response body
@@ -74,12 +91,12 @@ assert res["ticket_status"] == "open", res
 assert res["raw"] == {"id": "TKT-1001", "status": "open"}, res
 call = _calls[-1]
 files = call["files"]
-assert files["reason"] == (None, "1c366a67-dc37-4df8-8ae8-3ab07595a5c8"), files["reason"]
+assert files["reason"] == (None, "8ddc112a-e53a-4236-a9be-7f7f1db729ba"), files["reason"]
 assert files["text"] == (None, "לא מצליח להעלות תמונה"), files["text"]
 assert files["sourceEmail"] == (None, "user@example.com"), files.get("sourceEmail")
 assert files["sourcePhoneNumber"] == (None, "+972501234567"), files.get("sourcePhoneNumber")
-assert call["headers"]["Origin"] == "https://sugardaddy.co.il", call["headers"]
-assert call["headers"]["Referer"] == "https://sugardaddy.co.il/he/contact-us", call["headers"]
+assert call["headers"]["Origin"] == "https://qa.sugardaddy.co.il", call["headers"]
+assert call["headers"]["Referer"] == "https://qa.sugardaddy.co.il/he/contact-us", call["headers"]
 print("2. submit_ticket -> multipart fields, headers, ticket_id/status parsed")
 
 # 3) nested id/status containers + status fallback to "created"
