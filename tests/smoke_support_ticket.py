@@ -7,13 +7,21 @@ Never hits the network — requests.post is monkeypatched to capture the call.
 Verifies reason-key resolution, the multipart fields the backend expects, that
 the conversation phone is attached as sourcePhoneNumber, ticket id/status
 parsing from the response, DB persistence + open-ticket context, success/failure
-handling, and that the tool is registered in the server's tool list.
+handling, that the tool is registered in the server's tool list, and the
+admin (on-account) path: JSON payload + bearer auth, server-side routing for
+account-linked conversations, and fallback to the anonymous unauth endpoint.
 """
+import json as _json
 import os
 import pathlib
 import tempfile
+import uuid
 
-DB_PATH = str(pathlib.Path(tempfile.gettempdir()) / "sugarbot_smoke_tickets.db")
+# Unique per run so concurrent executions (parallel CI shards / agents) don't
+# race each other on a shared SQLite file.
+DB_PATH = str(
+    pathlib.Path(tempfile.gettempdir()) / f"sugarbot_smoke_tickets_{uuid.uuid4().hex}.db"
+)
 pathlib.Path(DB_PATH).unlink(missing_ok=True)
 
 # Force a clean local environment BEFORE importing sugarbot modules.
@@ -21,6 +29,8 @@ os.environ["DATABASE_URL"] = ""
 os.environ["USERS_DB_PATH"] = DB_PATH
 os.environ["OPENAI_API_KEY"] = "dummy-for-smoke-test"
 os.environ.pop("SUPPORT_TICKET_ENV", None)  # exercise the default (qa)
+os.environ.pop("SUGAR_ADMIN_API", None)  # admin path starts unconfigured
+os.environ.pop("SUPPORT_ADMIN_URL", None)
 
 from sugarbot import contact  # noqa: E402
 
@@ -43,8 +53,10 @@ _calls: list[dict] = []
 _next_body = {"id": "TKT-1001", "status": "open"}
 
 
-def _fake_post(url, files=None, headers=None, timeout=None):
-    _calls.append({"url": url, "files": files, "headers": headers, "timeout": timeout})
+def _fake_post(url, files=None, json=None, headers=None, timeout=None):
+    _calls.append(
+        {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+    )
     return _FakeResp(body=_next_body)
 
 
@@ -59,10 +71,20 @@ assert contact.SUPPORT_TICKET_ORIGIN == "https://qa.sugardaddy.co.il", contact.S
 assert (
     contact._ENV_DEFAULTS["qa"]["url"] != contact._ENV_DEFAULTS["prod"]["url"]
 ), "qa and prod must post to different backends"
-for env, ids in contact.REASON_IDS_BY_ENV.items():
-    missing = set(contact.REASON_CHOICES) - set(ids)
-    assert not missing, f"{env} map missing reasons: {missing}"
+# QA must map every choosable reason; prod may lag on newly added reasons
+# (their prod optionIds get snapshotted at launch) — those degrade to help_desk
+# via resolve_reason, checked below.
+missing_qa = set(contact.REASON_CHOICES) - set(contact.REASON_IDS_BY_ENV["qa"])
+assert not missing_qa, f"qa map missing reasons: {missing_qa}"
+_ORIGINAL_REASONS = {
+    "login_email", "help_desk", "forgot_password", "technical",
+    "remove_account", "report", "other",
+}
+missing_prod = _ORIGINAL_REASONS - set(contact.REASON_IDS_BY_ENV["prod"])
+assert not missing_prod, f"prod map missing original reasons: {missing_prod}"
 for key in contact.REASON_CHOICES:
+    if key not in contact.REASON_IDS_BY_ENV["prod"]:
+        continue  # unmapped in prod -> covered by the help_desk fallback check
     assert (
         contact.REASON_IDS_BY_ENV["qa"][key] != contact.REASON_IDS_BY_ENV["prod"][key]
     ), f"qa/prod optionId for {key} must differ (separate databases)"
@@ -70,11 +92,23 @@ for key in contact.REASON_CHOICES:
 # reason key -> optionId; raw UUID passes through; junk -> None
 assert contact.resolve_reason("technical") == "8ddc112a-e53a-4236-a9be-7f7f1db729ba"
 assert contact.resolve_reason("remove_account") == "8cdfdc39-1b26-4ba3-89bb-92407c84e11f"
+assert contact.resolve_reason("stop_payment") == "7d83d6f5-3b1b-4bae-8e69-94fc09fb85ca"
+assert contact.resolve_reason("id_verification") == "bfae8355-20ba-4141-8350-2eba146d6e3c"
+assert contact.resolve_reason("photo_verification") == "cc2c5598-c3a6-4664-b6d0-038e1369658b"
 raw = "12345678-1234-1234-1234-123456789abc"
 assert contact.resolve_reason(raw) == raw, "raw optionId should pass through"
 assert contact.resolve_reason("not-a-reason") is None
 assert contact.resolve_reason("") is None
-print("1. env profiles (qa default, qa!=prod); resolve_reason: key->id, raw uuid, junk->None")
+# A choosable reason with no optionId in the active env degrades to help_desk
+# (prod until its new-reason ids are snapshotted); junk still resolves to None.
+_saved_ids = contact.REASON_IDS
+contact.REASON_IDS = contact.REASON_IDS_BY_ENV["prod"]
+assert (
+    contact.resolve_reason("stop_payment") == contact.REASON_IDS_BY_ENV["prod"]["help_desk"]
+), "unmapped choosable reason must degrade to help_desk"
+assert contact.resolve_reason("not-a-reason") is None
+contact.REASON_IDS = _saved_ids
+print("1. env profiles (qa default, qa!=prod); resolve_reason: key->id, raw uuid, junk->None, help_desk fallback")
 
 # 2) successful submit builds the right multipart fields + headers, and parses
 #    ticket_id/status from the response body
@@ -170,7 +204,144 @@ params = tool["function"]["parameters"]
 assert params["properties"]["reason"]["enum"] == contact.REASON_CHOICES, params
 assert params["required"] == ["reason", "text"], params
 assert "phone" not in params["properties"] and "sourcePhoneNumber" not in params["properties"]
-print("8. server.TOOLS_ALL registers submit_support_ticket; phone not a model arg")
+for key in ("stop_payment", "id_verification", "photo_verification"):
+    assert key in params["properties"]["reason"]["enum"], key
+print("8. server.TOOLS_ALL registers submit_support_ticket; phone not a model arg; new reasons in enum")
+
+# 9) admin path: env defaults + availability guard (no token/url -> handled failure)
+assert (
+    contact._ADMIN_ENV_DEFAULTS["qa"]["url"] == "https://backend-admin.sugarinter.media/support"
+), contact._ADMIN_ENV_DEFAULTS
+assert contact._ADMIN_ENV_DEFAULTS["prod"]["url"] == "", "prod admin host unknown until launch"
+assert contact.SUGAR_ADMIN_API == "" and not contact.admin_available()
+_calls.clear()
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="x", user_id="u-1", source_phone="+972500000000"
+)
+assert res["ok"] is False and "not configured" in res["detail"], res
+assert _calls == [], "must not POST when the admin path is unconfigured"
+contact.SUGAR_ADMIN_API = "test-admin-token"
+contact.SUPPORT_ADMIN_URL = "https://admin.example/support"
+assert contact.admin_available()
+print("9. admin env defaults (qa set, prod empty); unconfigured -> ok=False, no POST")
+
+# 10) submit_admin_ticket: exact JSON contract + bearer header; failures handled
+_calls.clear()
+_next_body = {"id": "ADM-1", "status": "None"}
+res = contact.submit_admin_ticket(
+    reason="technical",
+    text="לא מצליח להעלות תמונה",
+    user_id="site-uuid-1",
+    source_phone="+972501234567",
+)
+# The admin backend's initial status is the literal string "None" — it must be
+# normalized away (fall back to "created") so it never reaches the customer.
+assert res["ok"] is True and res["ticket_id"] == "ADM-1" and res["ticket_status"] == "created", res
+call = _calls[-1]
+assert call["url"] == "https://admin.example/support", call
+assert call["files"] is None, "admin path must POST json, not multipart"
+assert call["headers"] == {"Authorization": "Bearer test-admin-token"}, call["headers"]
+assert call["json"] == {
+    "userId": "site-uuid-1",
+    "sources": ["WhatsApp"],
+    "reason": "8ddc112a-e53a-4236-a9be-7f7f1db729ba",
+    "text": "לא מצליח להעלות תמונה",
+    "status": "None",
+    "sourcePhoneNumber": "+972501234567",
+    "sourceNickname": "",
+    "sourceEmail": "",
+    "sourceUserId": "",
+    "isReplyFromCustomer": False,
+}, call["json"]
+_calls.clear()
+res = contact.submit_admin_ticket(reason="bogus", text="x", user_id="u", source_phone="p")
+assert res["ok"] is False and _calls == [], "unknown reason must not POST"
+contact.requests.post = _raise_post
+res = contact.submit_admin_ticket(reason="help_desk", text="x", user_id="u", source_phone="p")
+assert res["ok"] is False, res
+contact.requests.post = _fake_post
+print("10. submit_admin_ticket -> exact JSON payload + bearer; status 'None' normalized; failures handled")
+
+# 11) server routing: linked account -> admin path (on_account); anonymous -> unauth
+phone2 = "+972502223344"
+db.upsert_user(phone2, external_id="site-uuid-9", nickname="דנה", is_premium=True, labels=[])
+_calls.clear()
+_next_body = {"id": "ADM-2", "status": "None"}
+result = server._submit_ticket_for(phone2, {"reason": "help_desk", "text": "רוצה נציג"})
+parsed = _json.loads(result)
+assert parsed["submitted"] is True and parsed["on_account"] is True, parsed
+assert parsed["ticket_id"] == "ADM-2", parsed
+assert len(_calls) == 1 and _calls[0]["url"] == "https://admin.example/support", _calls
+assert _calls[0]["json"]["userId"] == "site-uuid-9", _calls[0]["json"]
+rows = db.recent_support_tickets(phone2)
+assert rows and rows[0]["ticket_id"] == "ADM-2", rows
+_calls.clear()
+_next_body = {"id": "TKT-3003", "status": "open"}
+result = server._submit_ticket_for("+972509998877", {"reason": "technical", "text": "תקלה"})
+parsed = _json.loads(result)
+assert parsed["submitted"] is True and parsed["on_account"] is False, parsed
+assert len(_calls) == 1 and _calls[0]["url"] == contact.SUPPORT_TICKET_URL, _calls
+assert _calls[0]["files"] is not None, "anonymous path must stay multipart"
+print("11. routing: linked -> admin (on_account=true, persisted); anonymous -> unauth multipart")
+
+# 12) admin failure -> unauth fallback (customer always gets a ticket);
+#     missing token -> admin never attempted
+def _admin_500_post(url, files=None, json=None, headers=None, timeout=None):
+    _calls.append(
+        {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+    )
+    if url == "https://admin.example/support":
+        return _FakeResp(status_code=500, reason="Server Error")
+    return _FakeResp(body={"id": "TKT-4004", "status": "open"})
+
+
+contact.requests.post = _admin_500_post
+_calls.clear()
+result = server._submit_ticket_for(phone2, {"reason": "help_desk", "text": "שוב"})
+parsed = _json.loads(result)
+assert parsed["submitted"] is True and parsed["on_account"] is False, parsed
+assert parsed["ticket_id"] == "TKT-4004", parsed
+assert [c["url"] for c in _calls] == [
+    "https://admin.example/support",
+    contact.SUPPORT_TICKET_URL,
+], _calls
+contact.requests.post = _fake_post
+contact.SUGAR_ADMIN_API = ""
+_calls.clear()
+_next_body = {"id": "TKT-5005", "status": "open"}
+result = server._submit_ticket_for(phone2, {"reason": "help_desk", "text": "עוד"})
+parsed = _json.loads(result)
+assert parsed["submitted"] is True and parsed["on_account"] is False, parsed
+assert len(_calls) == 1 and _calls[0]["url"] == contact.SUPPORT_TICKET_URL, _calls
+print("12. admin failure -> unauth fallback; no token -> straight to unauth")
+
+# 13) both paths fail -> submitted=false (the model must NOT claim a ticket was
+#     filed), nothing persisted
+def _all_500_post(url, files=None, json=None, headers=None, timeout=None):
+    _calls.append(
+        {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+    )
+    return _FakeResp(status_code=500, reason="Server Error")
+
+
+contact.SUGAR_ADMIN_API = "test-admin-token"  # admin path enabled again
+contact.requests.post = _all_500_post
+_tickets_before = len(db.recent_support_tickets(phone2))
+_calls.clear()
+result = server._submit_ticket_for(phone2, {"reason": "help_desk", "text": "כלום לא עובד"})
+parsed = _json.loads(result)
+assert parsed["submitted"] is False, parsed
+assert "ticket_id" not in parsed, "failed submit must not hand the model a ticket_id"
+assert parsed["instructions"], parsed
+assert [c["url"] for c in _calls] == [
+    "https://admin.example/support",
+    contact.SUPPORT_TICKET_URL,
+], _calls
+assert len(db.recent_support_tickets(phone2)) == _tickets_before, (
+    "failed submit must not persist a ticket"
+)
+contact.requests.post = _fake_post
+print("13. both paths fail -> submitted=false, no ticket_id, nothing persisted")
 
 pathlib.Path(DB_PATH).unlink(missing_ok=True)
 print("\nALL CHECKS PASSED")

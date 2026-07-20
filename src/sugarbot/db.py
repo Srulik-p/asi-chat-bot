@@ -126,10 +126,13 @@ conversation_state_table = Table(
 )
 
 
-# Help-desk tickets opened for a conversation (via contact.submit_ticket).
+# Help-desk tickets opened for a conversation (via contact.submit_ticket or,
+# for account-linked customers, contact.submit_admin_ticket).
 # Keyed by phone_number so later turns can surface an open ticket as context.
-# ticket_id/status come from the backend response; `raw` keeps the full body
-# because the backend's exact response shape is not documented.
+# ticket_id/status come from the backend response; `raw` is a wrapper
+# {"on_account": bool, "response": <full body>} recording which path filed the
+# ticket, kept whole because the backend's exact response shape is not
+# documented. Nothing parses `raw` programmatically — it is for ops inspection.
 support_tickets_table = Table(
     "support_tickets",
     _metadata,

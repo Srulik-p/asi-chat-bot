@@ -429,8 +429,12 @@ CONTACT_TOOLS = [
                 "what the customer needs, with any detail the team needs); include "
                 "`email` only if the customer gave one. The customer's phone is "
                 "attached automatically from the conversation — never ask for it or "
-                "pass it. After a successful submit, tell the customer a human "
-                "representative will get back to them during working hours."
+                "pass it. When the result returns on_account=true, the ticket was "
+                "attached to the customer's site account and the team sees their "
+                "details — no email needed to identify them; on_account=false means "
+                "it was filed with the phone only. After a successful submit, tell "
+                "the customer a human representative will get back to them during "
+                "working hours."
             ),
             "parameters": {
                 "type": "object",
@@ -443,7 +447,10 @@ CONTACT_TOOLS = [
                             "email), help_desk (talk to a rep), forgot_password, "
                             "technical (a bug/error on the site), remove_account "
                             "(delete their account), report (report a user/abuse), "
-                            "other."
+                            "stop_payment (stop/cancel a recurring charge or "
+                            "subscription billing), id_verification (ID/age "
+                            "verification), photo_verification (profile-photo "
+                            "verification), other."
                         ),
                     },
                     "text": {
@@ -554,6 +561,110 @@ def _open_ticket_note(phone: str) -> str | None:
         + "\nאם הלקוח שואל על סטטוס הפנייה - התייחס/י למספר ולסטטוס. "
         "אל תפתח/י פנייה כפולה על אותו נושא; אם כבר יש פנייה פתוחה בנושא, "
         "הזכר/י בעדינות שהיא כבר אצל הצוות."
+    )
+
+
+def _submit_ticket_for(phone: str, args: dict) -> str:
+    """Handle the submit_support_ticket tool call. Returns the JSON tool result.
+
+    Routing: a conversation linked to a site account (users.external_id exists —
+    any age; the 72h freshness window only gates get_account_status) files the
+    ticket ON the account via the admin API. Anonymous conversations, and any
+    admin-path failure, use the unauth contact-form endpoint so the customer
+    always ends up with a ticket. The phone comes from the conversation
+    identity (kept out of the model), attached as sourcePhoneNumber.
+    """
+    reason = args.get("reason", "")
+    text = args.get("text", "")
+    email = args.get("email") or None
+
+    external_id = None
+    try:
+        user = db.get_user_by_phone(phone)
+        external_id = (user or {}).get("external_id") or None
+    except Exception as e:
+        # A DB hiccup must not block filing anonymously.
+        print(
+            f"[chat] user lookup failed for {phone}: {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+
+    res = None
+    on_account = False
+    if external_id and contact.admin_available():
+        res = contact.submit_admin_ticket(
+            reason=reason,
+            text=text,
+            user_id=external_id,
+            source_phone=phone,
+            source_email=email,
+        )
+        if res["ok"]:
+            on_account = True
+        else:
+            print(
+                f"[chat] admin ticket failed for {phone} "
+                f"(http={res['http_status']} {res['detail']}); falling back to unauth",
+                file=sys.stderr,
+            )
+    if res is None or not res["ok"]:
+        res = contact.submit_ticket(
+            reason=reason,
+            text=text,
+            source_email=email,
+            source_phone=phone,
+        )
+
+    if res["ok"]:
+        # Persist so later turns can surface it as context. The ticket already
+        # exists in the help desk, so a persistence failure must not surface as
+        # a failed submit — the model would retry and file a duplicate.
+        try:
+            db.add_support_ticket(
+                phone,
+                ticket_id=res.get("ticket_id"),
+                status=res.get("ticket_status"),
+                reason=reason,
+                raw={"on_account": on_account, "response": res.get("raw")},
+            )
+        except Exception as persist_err:
+            print(
+                f"[chat] support-ticket context save failed for {phone}: "
+                f"{type(persist_err).__name__}: {persist_err}",
+                file=sys.stderr,
+            )
+        instructions = (
+            "הפנייה נפתחה במערכת התמיכה. עדכן/י את הלקוח "
+            "בקצרה שהפנייה נשלחה ושנציג אנושי יחזור אליו "
+            "בשעות הפעילות (א'-ה' 9:00-17:00). אם יש "
+            "ticket_id - מסור/י ללקוח את מספר הפנייה. "
+            "אל תבטיח/י זמן מדויק מעבר לזה."
+        )
+        if on_account:
+            instructions += (
+                " הפנייה נפתחה על חשבון האתר של הלקוח, כך שהצוות רואה את "
+                "פרטי החשבון - אין צורך לבקש מייל לזיהוי."
+            )
+        return json.dumps(
+            {
+                "submitted": True,
+                "ticket_id": res.get("ticket_id"),
+                "status": res.get("ticket_status"),
+                "on_account": on_account,
+                "instructions": instructions,
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "submitted": False,
+            "instructions": (
+                "פתיחת הפנייה נכשלה. אל תגיד/י ללקוח שנפתחה "
+                "פנייה. הצע/י לנסות שוב בעוד רגע, ואם דחוף - "
+                "העבר/י לנציג (escalate_to_human)."
+            ),
+        },
+        ensure_ascii=False,
     )
 
 
@@ -710,61 +821,8 @@ def _run_chat_locked(
                             db.mark_escalated(phone, datetime.now(timezone.utc))
                             result = json.dumps({"escalated": True}, ensure_ascii=False)
                         elif name == "submit_support_ticket":
-                            # phone comes from the conversation identity (kept out
-                            # of the model), attached as sourcePhoneNumber.
                             args = json.loads(tc.function.arguments or "{}")
-                            res = contact.submit_ticket(
-                                reason=args.get("reason", ""),
-                                text=args.get("text", ""),
-                                source_email=args.get("email") or None,
-                                source_phone=phone,
-                            )
-                            if res["ok"]:
-                                # Persist so later turns can surface it as context.
-                                # The ticket already exists in the help desk, so a
-                                # persistence failure must not surface as a failed
-                                # submit — the model would retry and file a duplicate.
-                                try:
-                                    db.add_support_ticket(
-                                        phone,
-                                        ticket_id=res.get("ticket_id"),
-                                        status=res.get("ticket_status"),
-                                        reason=args.get("reason", ""),
-                                        raw=res.get("raw"),
-                                    )
-                                except Exception as persist_err:
-                                    print(
-                                        f"[chat] support-ticket context save failed for {phone}: "
-                                        f"{type(persist_err).__name__}: {persist_err}",
-                                        file=sys.stderr,
-                                    )
-                                result = json.dumps(
-                                    {
-                                        "submitted": True,
-                                        "ticket_id": res.get("ticket_id"),
-                                        "status": res.get("ticket_status"),
-                                        "instructions": (
-                                            "הפנייה נפתחה במערכת התמיכה. עדכן/י את הלקוח "
-                                            "בקצרה שהפנייה נשלחה ושנציג אנושי יחזור אליו "
-                                            "בשעות הפעילות (א'-ה' 9:00-17:00). אם יש "
-                                            "ticket_id - מסור/י ללקוח את מספר הפנייה. "
-                                            "אל תבטיח/י זמן מדויק מעבר לזה."
-                                        ),
-                                    },
-                                    ensure_ascii=False,
-                                )
-                            else:
-                                result = json.dumps(
-                                    {
-                                        "submitted": False,
-                                        "instructions": (
-                                            "פתיחת הפנייה נכשלה. אל תגיד/י ללקוח שנפתחה "
-                                            "פנייה. הצע/י לנסות שוב בעוד רגע, ואם דחוף - "
-                                            "העבר/י לנציג (escalate_to_human)."
-                                        ),
-                                    },
-                                    ensure_ascii=False,
-                                )
+                            result = _submit_ticket_for(phone, args)
                         else:
                             fn = TOOL_FNS.get(name)
                             if fn is None:

@@ -7,6 +7,11 @@ of telling them to go fill the web form themselves.
 
 The form posts `multipart/form-data` to the "unauth" support endpoint.
 
+There is a second, authenticated path: when the customer's WhatsApp number is
+linked to a site account (we know their userId), `submit_admin_ticket` files
+the ticket ON that account via the admin backend (JSON POST with a bearer
+token), so the team sees it attached to the user instead of anonymous.
+
 The help desk exists in two environments, selected by SUPPORT_TICKET_ENV
 ("qa" — the default — or "prod"). The environment picks the backend host,
 the Origin/Referer headers, AND the ContactUsReason optionIds — QA and prod
@@ -19,7 +24,13 @@ Env configuration (all optional):
   SUPPORT_TICKET_URL       override the full URL to POST to
   SUPPORT_TICKET_ORIGIN    override the Origin header
   SUPPORT_TICKET_REFERER   override the Referer header
-  SUPPORT_TICKET_TIMEOUT   request timeout in seconds (default 10)
+  SUPPORT_TICKET_TIMEOUT   request timeout in seconds (default 10, shared
+                           with the admin path)
+  SUGAR_ADMIN_API          bearer token for the admin backend; unset ->
+                           admin path unavailable (anonymous filing only)
+  SUPPORT_ADMIN_URL        override the admin support endpoint (default
+                           per SUPPORT_TICKET_ENV; prod default is empty
+                           until the prod admin host is known)
 
 Multipart fields posted (mirrors the site frontend's FormData):
   reason               required — a ContactUsReason optionId
@@ -73,6 +84,16 @@ SUPPORT_TICKET_REFERER = os.getenv(
 )
 SUPPORT_TICKET_TIMEOUT = float(os.getenv("SUPPORT_TICKET_TIMEOUT", "10"))
 
+# Admin help-desk API — files a ticket ON a signed-in user's account. The prod
+# admin host is unknown until launch, so prod defaults to "" (admin path
+# unavailable -> callers fall back to the anonymous unauth endpoint).
+_ADMIN_ENV_DEFAULTS = {
+    "qa": {"url": "https://backend-admin.sugarinter.media/support"},
+    "prod": {"url": ""},
+}
+SUGAR_ADMIN_API = os.getenv("SUGAR_ADMIN_API", "").strip()
+SUPPORT_ADMIN_URL = os.getenv("SUPPORT_ADMIN_URL", _ADMIN_ENV_DEFAULTS[SUPPORT_TICKET_ENV]["url"])
+
 # Friendly, stable key -> ContactUsReason optionId, per environment. Keys are
 # what the model passes; the UUIDs are what the backend requires. QA and prod
 # are separate databases — the same reason has a different optionId in each
@@ -90,7 +111,13 @@ REASON_IDS_BY_ENV = {
         "other": "e3735ae8-8ec5-451d-9a4e-cf06b6c75ae0",             # אחר
         "report": "1dadbff9-e64c-450b-b63f-27ef76238b47",            # דיווח
         "admin_declined": "ea78e71e-6f01-40a3-a94a-149d80203f34",    # admin declined
+        "stop_payment": "7d83d6f5-3b1b-4bae-8e69-94fc09fb85ca",      # הפסקת תשלום
+        "id_verification": "bfae8355-20ba-4141-8350-2eba146d6e3c",   # אימות תעודת זהות
+        "photo_verification": "cc2c5598-c3a6-4664-b6d0-038e1369658b",  # אימות תמונה
     },
+    # stop_payment / id_verification / photo_verification: prod optionIds are
+    # unknown until launch (snapshot them from prod /user/option/all); until
+    # then resolve_reason degrades those keys to help_desk in prod.
     "prod": {
         "login_email": "4e2f8c6f-5a9b-4cf4-bf9f-b5b21d3bacbe",       # לא מצליח להתחבר עם המייל שלי
         "help_desk": "4174349b-a7d5-4986-8a57-8dd8399ac334",         # שיחה עם נציג שירות לקוחות
@@ -115,6 +142,9 @@ REASON_CHOICES = [
     "technical",
     "remove_account",
     "report",
+    "stop_payment",
+    "id_verification",
+    "photo_verification",
     "other",
 ]
 
@@ -129,7 +159,20 @@ def resolve_reason(reason: str) -> str | None:
     reason = reason.strip()
     if reason in REASON_IDS:
         return REASON_IDS[reason]
+    if reason in REASON_CHOICES:
+        # Known category not yet mapped in this environment (e.g. prod ids
+        # pending) — degrade to help_desk so the ticket still files.
+        fallback = REASON_IDS.get("help_desk")
+        if fallback:
+            print(
+                f"[contact] reason {reason!r} has no optionId in the active reason map; "
+                "using help_desk",
+                file=sys.stderr,
+            )
+            return fallback
     # Already a raw optionId (e.g. copied straight from /user/option/all)?
+    # Note: env-blind — a UUID from the wrong environment is rejected by the
+    # backend, which surfaces as a handled ok=False.
     parts = reason.split("-")
     if len(parts) == 5 and all(parts) and reason.replace("-", "").isalnum():
         return reason
@@ -258,6 +301,83 @@ def submit_ticket(
 
     ticket_id, status, raw = _extract_ticket_fields(resp)
     # Always store a status; fall back to "created" when the body omits one.
+    return _result(
+        True,
+        http_status=resp.status_code,
+        ticket_id=ticket_id,
+        ticket_status=status or "created",
+        detail="created",
+        raw=raw,
+    )
+
+
+def admin_available() -> bool:
+    """True when the admin (on-account) ticket path is configured.
+
+    Reads the module globals at call time so tests (and future hot config)
+    can swap SUGAR_ADMIN_API / SUPPORT_ADMIN_URL after import.
+    """
+    return bool(SUGAR_ADMIN_API and SUPPORT_ADMIN_URL)
+
+
+def submit_admin_ticket(
+    reason: str,
+    text: str,
+    *,
+    user_id: str,
+    source_phone: str,
+    source_email: str | None = None,
+) -> dict:
+    """POST a support ticket onto a site account via the admin API.
+
+    `user_id` is the site account id (users.external_id). Returns the same
+    result dict as submit_ticket; never raises — callers fall back to the
+    anonymous submit_ticket path on ok=False.
+    """
+    if not admin_available():
+        return _result(False, detail="admin API not configured")
+
+    reason_id = resolve_reason(reason)
+    if reason_id is None:
+        return _result(False, detail=f"unknown reason: {reason}")
+
+    # Mirrors the admin panel's manual-ticket payload. sourceNickname stays
+    # empty on purpose: the backend resolves the account (and its current
+    # nickname) from userId, and our cached copy may be stale.
+    payload = {
+        "userId": user_id,
+        "sources": ["WhatsApp"],
+        "reason": reason_id,
+        "text": text or "",
+        "status": "None",
+        "sourcePhoneNumber": source_phone,
+        "sourceNickname": "",
+        "sourceEmail": source_email or "",
+        "sourceUserId": "",
+        "isReplyFromCustomer": False,
+    }
+
+    try:
+        resp = requests.post(
+            SUPPORT_ADMIN_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {SUGAR_ADMIN_API}"},
+            timeout=SUPPORT_TICKET_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        print(f"[contact] admin ticket failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return _result(False, detail=f"{type(e).__name__}: {e}")
+
+    if not resp.ok:
+        print(f"[contact] admin ticket HTTP {resp.status_code}", file=sys.stderr)
+        return _result(False, http_status=resp.status_code, detail=resp.reason)
+
+    ticket_id, status, raw = _extract_ticket_fields(resp)
+    if status == "None":
+        # The admin backend's initial status enum is the literal string "None"
+        # (= new/unhandled). Treat it as absent so it doesn't reach the customer
+        # as "סטטוס: None"; the raw body keeps the original value.
+        status = None
     return _result(
         True,
         http_status=resp.status_code,
