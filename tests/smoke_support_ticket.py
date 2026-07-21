@@ -223,7 +223,10 @@ assert _calls == [], "must not POST when the admin path is unconfigured"
 contact.SUGAR_ADMIN_API = "test-admin-token"
 contact.SUPPORT_ADMIN_URL = "https://admin.example/support"
 assert contact.admin_available()
-print("9. admin env defaults (qa set, prod empty); unconfigured -> ok=False, no POST")
+assert contact.SUPPORT_ADMIN_TIMEOUT == 3.0, contact.SUPPORT_ADMIN_TIMEOUT
+masked = contact._safe_err(Exception("boom test-admin-token boom"))
+assert "test-admin-token" not in masked and "***" in masked, masked
+print("9. admin env defaults (qa set, prod empty); unconfigured -> no POST; token masked in errors")
 
 # 10) submit_admin_ticket: exact JSON contract + bearer header; failures handled
 _calls.clear()
@@ -342,6 +345,173 @@ assert len(db.recent_support_tickets(phone2)) == _tickets_before, (
 )
 contact.requests.post = _fake_post
 print("13. both paths fail -> submitted=false, no ticket_id, nothing persisted")
+
+# 14) fetch_admin_ticket_messages: URL/payload/bearer contract; failures handled
+TICKET_UUID = "475d8495-6274-4cd6-b2d7-cde697f5cb55"
+_THREAD_BODY = {
+    "totalItems": 2,
+    "page": 1,
+    "data": [
+        {
+            "id": "m2",
+            "sentAt": "2026-07-21T12:00:00.000Z",
+            "text": "בדקנו - החשבון שוחרר. שלחנו קישור ל-dana@gmail.com",
+            "isAdminMessage": True,
+            "sender": {"nickname": "Admin", "email": "admin@test.com"},
+        },
+        {
+            "id": "m1",
+            "sentAt": "2026-07-21T10:56:45.343Z",
+            "text": "הלקוח מבקש שנציג אנושי יחזור אליו",
+            "source": "WhatsApp",
+            "isAdminMessage": True,
+            "sender": {"nickname": "Bot", "email": "bot@test.com"},
+        },
+    ],
+}
+_calls.clear()
+_next_body = _THREAD_BODY
+res = contact.fetch_admin_ticket_messages(TICKET_UUID)
+assert res["ok"] is True and res["total"] == 2 and len(res["messages"]) == 2, res
+call = _calls[-1]
+assert call["url"] == f"https://admin.example/support/{TICKET_UUID}/messages/list", call["url"]
+assert call["json"] == {"pagination": {"limit": 50, "page": 1}}, call["json"]
+assert call["headers"] == {"Authorization": "Bearer test-admin-token"}, call["headers"]
+assert call["files"] is None
+contact.SUGAR_ADMIN_API = ""
+_calls.clear()
+res = contact.fetch_admin_ticket_messages(TICKET_UUID)
+assert res["ok"] is False and _calls == [], "must not POST when admin unconfigured"
+contact.SUGAR_ADMIN_API = "test-admin-token"
+res = contact.fetch_admin_ticket_messages("")
+assert res["ok"] is False and _calls == [], "must not POST without a ticket id"
+contact.requests.post = _raise_post
+res = contact.fetch_admin_ticket_messages(TICKET_UUID)
+assert res["ok"] is False and res["messages"] == [], res
+contact.requests.post = _fake_post
+# a 200 with an unrecognized shape is a loud failure, not an empty thread
+_next_body = {"totalItems": 1, "data": {"items": []}}
+res = contact.fetch_admin_ticket_messages(TICKET_UUID)
+assert res["ok"] is False and "shape" in res["detail"], res
+# strict UUID gate: canonical hex only — Unicode/ASCII 5-dash-group junk fails
+assert contact.looks_like_uuid(TICKET_UUID) and not contact.looks_like_uuid("TKT-1001")
+assert not contact.looks_like_uuid("אימות-תעודת-זהות-של-לקוח")
+assert not contact.looks_like_uuid("not-a-real-uuid-here")
+assert contact.resolve_reason("אימות-תעודת-זהות-של-לקוח") is None
+print("14. fetch_admin_ticket_messages -> URL/payload/bearer; shape drift loud; strict UUID gate")
+
+# 15) _open_ticket_note includes the newest ticket's thread; degrades gracefully
+phone3 = "+972503334455"
+db.add_support_ticket(phone3, ticket_id=TICKET_UUID, status="created", reason="help_desk", raw={})
+# fetch failure with NO cached render yet -> note lists the ticket, no thread
+contact.requests.post = _raise_post
+note = server._open_ticket_note(phone3)
+assert note and TICKET_UUID in note and "החשבון שוחרר" not in note, note
+contact.requests.post = _fake_post
+# successful fetch -> thread included
+_next_body = _THREAD_BODY
+_calls.clear()
+note = server._open_ticket_note(phone3)
+assert note and TICKET_UUID in note, note
+assert "הלקוח מבקש שנציג אנושי יחזור אליו" in note, note
+assert "החשבון שוחרר" in note, note
+assert note.index("מבקש שנציג") < note.index("החשבון שוחרר"), "thread must be chronological"
+assert "admin@test.com" not in note and "Admin" not in note, "sender identity must stay out"
+assert "dana@gmail.com" not in note and "[מייל]" in note, "message-body PII must be redacted"
+assert "15:00" in note and "12:00" not in note, "sentAt must render in Israel time, not UTC"
+# the chat-filed original (source=WhatsApp, isAdminMessage=true) must NOT be
+# labeled as a team reply; the real team message keeps the צוות label
+assert "נשלח מהשיחה" in note, "chat-filed message must not be labeled as team"
+assert note.index("נשלח מהשיחה") < note.index("מבקש שנציג"), note
+assert "צוות: בדקנו" in note, note
+assert "<<<" in note and ">>>" in note and "ציטוט" in note, "thread must be fenced as quoted data"
+assert "השרשור המלא" in note and "תוכן הפנייה המקורי" not in note, note
+assert len(_calls) == 1 and _calls[0]["url"].endswith(f"/{TICKET_UUID}/messages/list"), _calls
+# fetch failure AFTER a good render -> last good thread reused (stable note,
+# no prompt-cache thrash)
+contact.requests.post = _raise_post
+note = server._open_ticket_note(phone3)
+assert note and "החשבון שוחרר" in note, "transient failure must reuse the last good thread"
+contact.requests.post = _fake_post
+# a successful EMPTY fetch drops the cached render: stale thread must not
+# resurrect on the next failure
+_next_body = {"totalItems": 0, "page": 1, "data": []}
+note = server._open_ticket_note(phone3)
+assert note and TICKET_UUID in note and "החשבון שוחרר" not in note, note
+contact.requests.post = _raise_post
+note = server._open_ticket_note(phone3)
+assert note and "החשבון שוחרר" not in note, "emptied thread must not resurrect from cache"
+contact.requests.post = _fake_post
+# non-UUID ticket ids (unauth-style) never hit the admin endpoint
+_calls.clear()
+note2 = server._open_ticket_note(phone2)  # all of phone2's tickets are non-UUID
+assert note2 and "TKT-5005" in note2 and _calls == [], (note2, _calls)
+# a newer non-UUID ticket (fallback duplicate) must not mask an older
+# on-account UUID ticket's thread
+phone5 = "+972505556677"
+TICKET_UUID_3 = "7b2c3d4e-5f6a-4b7c-8d9e-0f1a2b3c4d5e"
+db.add_support_ticket(phone5, ticket_id=TICKET_UUID_3, status="created", reason="help_desk", raw={})
+db.add_support_ticket(phone5, ticket_id="TKT-7777", status="created", reason="other", raw={})
+_next_body = _THREAD_BODY
+_calls.clear()
+note = server._open_ticket_note(phone5)
+assert len(_calls) == 1 and _calls[0]["url"].endswith(f"/{TICKET_UUID_3}/messages/list"), _calls
+assert "החשבון שוחרר" in note, "older UUID ticket's thread must still be fetched"
+# admin unconfigured -> no fetch at all
+contact.SUGAR_ADMIN_API = ""
+_calls.clear()
+note = server._open_ticket_note(phone3)
+assert note and TICKET_UUID in note and _calls == [], "no admin config -> no fetch"
+contact.SUGAR_ADMIN_API = "test-admin-token"
+print("15. note thread: labels, IL time, PII-redacted, fenced; cache reuse/drop; no UUID masking")
+
+# 16) thread hardening: mixed-type sentAt must not crash the note; long threads
+#     get a truncation marker instead of the original-message hint
+phone4 = "+972504445566"
+TICKET_UUID_2 = "6a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+db.add_support_ticket(phone4, ticket_id=TICKET_UUID_2, status="created", reason="technical", raw={})
+_next_body = {
+    "totalItems": 2,
+    "page": 1,
+    "data": [
+        {"id": "x1", "sentAt": 1784632909747, "text": "הודעה עם זמן מספרי", "isAdminMessage": True},
+        {"id": "x2", "sentAt": "2026-07-21T10:00:00.000Z", "text": "הודעה רגילה", "isAdminMessage": False},
+    ],
+}
+note = server._open_ticket_note(phone4)
+assert note and "הודעה רגילה" in note and "הודעה עם זמן מספרי" in note, note
+# epoch-millis (11:21Z) parses to a real Israel-time stamp and sorts by parsed
+# time AFTER the older ISO message (10:00Z) — a lexical sort ('1…' < '2…')
+# would have put it first
+assert "- [] " not in note and "[2026-07-21 14:21]" in note, note
+assert note.index("הודעה רגילה") < note.index("הודעה עם זמן מספרי"), (
+    "numeric sentAt must sort by parsed time, not lexically"
+)
+_next_body = {
+    "totalItems": 7,
+    "page": 1,
+    "data": [
+        {
+            "id": f"t{i}",
+            "sentAt": f"2026-07-21T0{i}:00:00.000Z",
+            "text": f"הודעה מספר {i}",
+            "isAdminMessage": True,
+        }
+        for i in range(1, 8)
+    ],
+}
+note = server._open_ticket_note(phone4)
+assert "מוצגות 5 ההודעות האחרונות מתוך 7" in note, note
+assert "תוכן הפנייה המקורי" not in note, "truncated thread must not claim the original is shown"
+assert "הודעה מספר 7" in note and "הודעה מספר 1" not in note, note
+assert "ייתכן שחסרות" not in note, "full-page truncation must not warn about pagination"
+# backend holds more messages than the page returned -> the note must not
+# claim these are the newest
+_next_body["totalItems"] = 60
+note = server._open_ticket_note(phone4)
+assert "מוצגות 5 הודעות מתוך 60" in note and "ייתכן שחסרות" in note, note
+assert "ההודעות האחרונות" not in note, "paginated thread must drop the 'newest' claim"
+print("16. thread hardening: numeric sentAt parsed+ordered; truncation and pagination honest")
 
 pathlib.Path(DB_PATH).unlink(missing_ok=True)
 print("\nALL CHECKS PASSED")

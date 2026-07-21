@@ -11,6 +11,10 @@ There is a second, authenticated path: when the customer's WhatsApp number is
 linked to a site account (we know their userId), `submit_admin_ticket` files
 the ticket ON that account via the admin backend (JSON POST with a bearer
 token), so the team sees it attached to the user instead of anonymous.
+The same admin backend also serves a ticket's message thread
+(`fetch_admin_ticket_messages`), which the server surfaces to the assistant
+so it can quote the team's actual reply instead of a generic "it's with the
+team".
 
 The help desk exists in two environments, selected by SUPPORT_TICKET_ENV
 ("qa" — the default — or "prod"). The environment picks the backend host,
@@ -24,13 +28,17 @@ Env configuration (all optional):
   SUPPORT_TICKET_URL       override the full URL to POST to
   SUPPORT_TICKET_ORIGIN    override the Origin header
   SUPPORT_TICKET_REFERER   override the Referer header
-  SUPPORT_TICKET_TIMEOUT   request timeout in seconds (default 10, shared
-                           with the admin path)
+  SUPPORT_TICKET_TIMEOUT   request timeout in seconds (default 10)
   SUGAR_ADMIN_API          bearer token for the admin backend; unset ->
                            admin path unavailable (anonymous filing only)
   SUPPORT_ADMIN_URL        override the admin support endpoint (default
                            per SUPPORT_TICKET_ENV; prod default is empty
-                           until the prod admin host is known)
+                           until the prod admin host is known; an empty
+                           override falls back to the env default)
+  SUPPORT_ADMIN_TIMEOUT    admin request timeout in seconds (default 3 —
+                           deliberately short: the anonymous fallback
+                           covers admin failures, and the thread fetch
+                           runs on the chat hot path)
 
 Multipart fields posted (mirrors the site frontend's FormData):
   reason               required — a ContactUsReason optionId
@@ -51,6 +59,7 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
 
 import requests
 
@@ -91,8 +100,19 @@ _ADMIN_ENV_DEFAULTS = {
     "qa": {"url": "https://backend-admin.sugarinter.media/support"},
     "prod": {"url": ""},
 }
-SUGAR_ADMIN_API = os.getenv("SUGAR_ADMIN_API", "").strip()
-SUPPORT_ADMIN_URL = os.getenv("SUPPORT_ADMIN_URL", _ADMIN_ENV_DEFAULTS[SUPPORT_TICKET_ENV]["url"])
+# Whitespace-collapsed, not just stripped: a line-wrapped copy-paste would
+# otherwise break the Authorization header, and requests' InvalidHeader error
+# embeds the offending value (the token) in its message.
+SUGAR_ADMIN_API = "".join(os.getenv("SUGAR_ADMIN_API", "").split())
+# A set-but-empty override falls back to the env default (disable the admin
+# path by unsetting the token, not by blanking the URL); normalized once here
+# so every consumer gets a clean, slash-free base.
+SUPPORT_ADMIN_URL = (
+    (os.getenv("SUPPORT_ADMIN_URL") or _ADMIN_ENV_DEFAULTS[SUPPORT_TICKET_ENV]["url"])
+    .strip()
+    .rstrip("/")
+)
+SUPPORT_ADMIN_TIMEOUT = float(os.getenv("SUPPORT_ADMIN_TIMEOUT", "3"))
 
 # Friendly, stable key -> ContactUsReason optionId, per environment. Keys are
 # what the model passes; the UUIDs are what the backend requires. QA and prod
@@ -149,6 +169,21 @@ REASON_CHOICES = [
 ]
 
 
+def looks_like_uuid(value: str) -> bool:
+    """Strict canonical-form UUID check (8-4-4-4-12 hex).
+
+    str.isalnum() is Unicode-aware, so a loose shape check would accept
+    5-dash-group Hebrew/non-hex strings and forward them to the backend as
+    optionIds or URL path segments."""
+    if not isinstance(value, str) or len(value) != 36 or value.count("-") != 4:
+        return False
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        return False
+    return True
+
+
 def resolve_reason(reason: str) -> str | None:
     """Map a friendly reason key to its optionId. A raw UUID passes through.
 
@@ -173,8 +208,7 @@ def resolve_reason(reason: str) -> str | None:
     # Already a raw optionId (e.g. copied straight from /user/option/all)?
     # Note: env-blind — a UUID from the wrong environment is rejected by the
     # backend, which surfaces as a handled ok=False.
-    parts = reason.split("-")
-    if len(parts) == 5 and all(parts) and reason.replace("-", "").isalnum():
+    if looks_like_uuid(reason):
         return reason
     return None
 
@@ -236,6 +270,54 @@ def _result(
     }
 
 
+def _safe_err(e: Exception) -> str:
+    """Format an exception for logs/details with the admin token masked —
+    some requests exceptions (e.g. InvalidHeader) embed the header value."""
+    s = f"{type(e).__name__}: {e}"
+    if SUGAR_ADMIN_API:
+        s = s.replace(SUGAR_ADMIN_API, "***")
+    return s
+
+
+def _send_ticket_request(
+    kind: str,
+    url: str,
+    *,
+    files: dict | None = None,
+    json_body: dict | None = None,
+    headers: dict | None = None,
+    timeout: float | None = None,
+) -> dict:
+    """POST a help-desk submit request and parse the ticket response.
+
+    Shared tail for both senders so their behavior can't drift. Never raises."""
+    try:
+        resp = requests.post(url, files=files, json=json_body, headers=headers, timeout=timeout)
+    except requests.RequestException as e:
+        print(f"[contact] {kind} failed: {_safe_err(e)}", file=sys.stderr)
+        return _result(False, detail=_safe_err(e))
+
+    if not resp.ok:
+        print(f"[contact] {kind} HTTP {resp.status_code}", file=sys.stderr)
+        return _result(False, http_status=resp.status_code, detail=resp.reason)
+
+    ticket_id, status, raw = _extract_ticket_fields(resp)
+    if status == "None":
+        # The help desk's initial status enum is the literal string "None"
+        # (= new/unhandled). Treat it as absent so it doesn't reach the
+        # customer as "סטטוס: None"; the raw body keeps the original value.
+        status = None
+    # Always store a status; fall back to "created" when the body omits one.
+    return _result(
+        True,
+        http_status=resp.status_code,
+        ticket_id=ticket_id,
+        ticket_status=status or "created",
+        detail="created",
+        raw=raw,
+    )
+
+
 def submit_ticket(
     reason: str,
     text: str,
@@ -284,30 +366,12 @@ def submit_ticket(
         "Referer": SUPPORT_TICKET_REFERER,
     }
 
-    try:
-        resp = requests.post(
-            SUPPORT_TICKET_URL,
-            files=files,
-            headers=headers,
-            timeout=SUPPORT_TICKET_TIMEOUT,
-        )
-    except requests.RequestException as e:
-        print(f"[contact] support ticket failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return _result(False, detail=f"{type(e).__name__}: {e}")
-
-    if not resp.ok:
-        print(f"[contact] support ticket HTTP {resp.status_code}", file=sys.stderr)
-        return _result(False, http_status=resp.status_code, detail=resp.reason)
-
-    ticket_id, status, raw = _extract_ticket_fields(resp)
-    # Always store a status; fall back to "created" when the body omits one.
-    return _result(
-        True,
-        http_status=resp.status_code,
-        ticket_id=ticket_id,
-        ticket_status=status or "created",
-        detail="created",
-        raw=raw,
+    return _send_ticket_request(
+        "support ticket",
+        SUPPORT_TICKET_URL,
+        files=files,
+        headers=headers,
+        timeout=SUPPORT_TICKET_TIMEOUT,
     )
 
 
@@ -318,6 +382,53 @@ def admin_available() -> bool:
     can swap SUGAR_ADMIN_API / SUPPORT_ADMIN_URL after import.
     """
     return bool(SUGAR_ADMIN_API and SUPPORT_ADMIN_URL)
+
+
+def _messages_result(ok: bool, *, total=None, messages: list | None = None, detail: str = "") -> dict:
+    return {"ok": ok, "total": total, "messages": messages or [], "detail": detail}
+
+
+def fetch_admin_ticket_messages(ticket_id: str, *, limit: int = 50, page: int = 1) -> dict:
+    """Fetch a ticket's message thread from the admin API. Never raises.
+
+    Returns {"ok": bool, "total": int | None, "messages": list[dict], "detail": str}.
+    `messages` are the backend's message dicts as-is (id, sentAt, text, source,
+    isAdminMessage, sender, ...); callers pick the fields they need.
+    """
+    if not admin_available():
+        return _messages_result(False, detail="admin API not configured")
+    if not ticket_id:
+        return _messages_result(False, detail="no ticket id")
+
+    url = f"{SUPPORT_ADMIN_URL}/{ticket_id}/messages/list"
+    try:
+        resp = requests.post(
+            url,
+            json={"pagination": {"limit": limit, "page": page}},
+            headers={"Authorization": f"Bearer {SUGAR_ADMIN_API}"},
+            timeout=SUPPORT_ADMIN_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        print(f"[contact] ticket messages fetch failed: {_safe_err(e)}", file=sys.stderr)
+        return _messages_result(False, detail=_safe_err(e))
+
+    if not resp.ok:
+        print(f"[contact] ticket messages HTTP {resp.status_code}", file=sys.stderr)
+        return _messages_result(False, detail=f"HTTP {resp.status_code}")
+
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        # A 200 whose shape we don't recognize is a loud failure: treating it
+        # as an empty thread would silently blank every note, with no HTTP
+        # error anywhere to hint why.
+        print("[contact] ticket messages: unexpected response shape", file=sys.stderr)
+        return _messages_result(False, detail="unexpected response shape")
+    messages = [m for m in data if isinstance(m, dict)]
+    return _messages_result(True, total=body.get("totalItems"), messages=messages)
 
 
 def submit_admin_ticket(
@@ -357,32 +468,10 @@ def submit_admin_ticket(
         "isReplyFromCustomer": False,
     }
 
-    try:
-        resp = requests.post(
-            SUPPORT_ADMIN_URL,
-            json=payload,
-            headers={"Authorization": f"Bearer {SUGAR_ADMIN_API}"},
-            timeout=SUPPORT_TICKET_TIMEOUT,
-        )
-    except requests.RequestException as e:
-        print(f"[contact] admin ticket failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return _result(False, detail=f"{type(e).__name__}: {e}")
-
-    if not resp.ok:
-        print(f"[contact] admin ticket HTTP {resp.status_code}", file=sys.stderr)
-        return _result(False, http_status=resp.status_code, detail=resp.reason)
-
-    ticket_id, status, raw = _extract_ticket_fields(resp)
-    if status == "None":
-        # The admin backend's initial status enum is the literal string "None"
-        # (= new/unhandled). Treat it as absent so it doesn't reach the customer
-        # as "סטטוס: None"; the raw body keeps the original value.
-        status = None
-    return _result(
-        True,
-        http_status=resp.status_code,
-        ticket_id=ticket_id,
-        ticket_status=status or "created",
-        detail="created",
-        raw=raw,
+    return _send_ticket_request(
+        "admin ticket",
+        SUPPORT_ADMIN_URL,
+        json_body=payload,
+        headers={"Authorization": f"Bearer {SUGAR_ADMIN_API}"},
+        timeout=SUPPORT_ADMIN_TIMEOUT,
     )
