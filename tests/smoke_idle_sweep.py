@@ -4,7 +4,7 @@ Run with:
     uv run python tests/smoke_idle_sweep.py
 
 Uses a throwaway SQLite DB and dummy secrets; never calls OpenAI or the
-outbound sender (OUTBOUND_SEND_URL is empty so notifier no-ops). The sweep's
+outbound sender (WHATSAPP_API_URL is empty so notifier no-ops). The sweep's
 state machine still advances even when delivery is a no-op.
 """
 import datetime as dt
@@ -20,7 +20,7 @@ os.environ["USERS_DB_PATH"] = DB_PATH
 os.environ["OPENAI_API_KEY"] = "dummy-for-smoke-test"
 os.environ["AUTH_CALLBACK_SECRET"] = "smoke-secret"
 os.environ["INTERNAL_API_SECRET"] = "smoke-internal"
-os.environ["OUTBOUND_SEND_URL"] = ""  # notifier no-ops
+os.environ["WHATSAPP_API_URL"] = ""  # notifier no-ops
 os.environ["INACTIVITY_WARN_HOURS"] = "24"
 os.environ["INACTIVITY_CLOSE_HOURS"] = "48"
 

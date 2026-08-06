@@ -173,7 +173,8 @@ assert len(rows) == 1 and rows[0]["ticket_id"] == "TKT-1001" and rows[0]["status
 from sugarbot import server  # noqa: E402
 
 note = server._open_ticket_note(phone)
-assert note and "TKT-1001" in note and "open" in note, note
+assert note and "open" in note and "technical" in note, note
+assert "TKT-1001" not in note, "ticket ids must stay out of the model-facing note"
 # a phone with no tickets gets no note
 assert server._open_ticket_note("+972500000999") is None
 # tickets older than the freshness window are not surfaced
@@ -249,13 +250,19 @@ assert call["json"] == {
     "sources": ["WhatsApp"],
     "reason": "8ddc112a-e53a-4236-a9be-7f7f1db729ba",
     "text": "לא מצליח להעלות תמונה",
-    "status": "None",
+    "status": "ForCustomerService",
     "sourcePhoneNumber": "+972501234567",
     "sourceNickname": "",
     "sourceEmail": "",
     "sourceUserId": "",
     "isReplyFromCustomer": False,
 }, call["json"]
+# a meaningful echoed status passes through to DB/context untouched
+_next_body = {"id": "ADM-9", "status": "ForCustomerService"}
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="x", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and res["ticket_status"] == "ForCustomerService", res
 _calls.clear()
 res = contact.submit_admin_ticket(reason="bogus", text="x", user_id="u", source_phone="p")
 assert res["ok"] is False and _calls == [], "unknown reason must not POST"
@@ -273,7 +280,7 @@ _next_body = {"id": "ADM-2", "status": "None"}
 result = server._submit_ticket_for(phone2, {"reason": "help_desk", "text": "רוצה נציג"})
 parsed = _json.loads(result)
 assert parsed["submitted"] is True and parsed["on_account"] is True, parsed
-assert parsed["ticket_id"] == "ADM-2", parsed
+assert "ticket_id" not in parsed, "raw ticket id must never reach the model"
 assert len(_calls) == 1 and _calls[0]["url"] == "https://admin.example/support", _calls
 assert _calls[0]["json"]["userId"] == "site-uuid-9", _calls[0]["json"]
 rows = db.recent_support_tickets(phone2)
@@ -303,7 +310,8 @@ _calls.clear()
 result = server._submit_ticket_for(phone2, {"reason": "help_desk", "text": "שוב"})
 parsed = _json.loads(result)
 assert parsed["submitted"] is True and parsed["on_account"] is False, parsed
-assert parsed["ticket_id"] == "TKT-4004", parsed
+assert "ticket_id" not in parsed, parsed
+assert db.recent_support_tickets(phone2)[0]["ticket_id"] == "TKT-4004", "fallback ticket persisted"
 assert [c["url"] for c in _calls] == [
     "https://admin.example/support",
     contact.SUPPORT_TICKET_URL,
@@ -406,13 +414,13 @@ db.add_support_ticket(phone3, ticket_id=TICKET_UUID, status="created", reason="h
 # fetch failure with NO cached render yet -> note lists the ticket, no thread
 contact.requests.post = _raise_post
 note = server._open_ticket_note(phone3)
-assert note and TICKET_UUID in note and "החשבון שוחרר" not in note, note
+assert note and "פנייה" in note and "החשבון שוחרר" not in note, note
 contact.requests.post = _fake_post
-# successful fetch -> thread included
+# successful fetch -> thread included; the raw ticket id stays out of the note
 _next_body = _THREAD_BODY
 _calls.clear()
 note = server._open_ticket_note(phone3)
-assert note and TICKET_UUID in note, note
+assert note and TICKET_UUID not in note, "ticket ids must stay out of the note"
 assert "הלקוח מבקש שנציג אנושי יחזור אליו" in note, note
 assert "החשבון שוחרר" in note, note
 assert note.index("מבקש שנציג") < note.index("החשבון שוחרר"), "thread must be chronological"
@@ -437,7 +445,7 @@ contact.requests.post = _fake_post
 # resurrect on the next failure
 _next_body = {"totalItems": 0, "page": 1, "data": []}
 note = server._open_ticket_note(phone3)
-assert note and TICKET_UUID in note and "החשבון שוחרר" not in note, note
+assert note and "פנייה" in note and "החשבון שוחרר" not in note, note
 contact.requests.post = _raise_post
 note = server._open_ticket_note(phone3)
 assert note and "החשבון שוחרר" not in note, "emptied thread must not resurrect from cache"
@@ -445,7 +453,8 @@ contact.requests.post = _fake_post
 # non-UUID ticket ids (unauth-style) never hit the admin endpoint
 _calls.clear()
 note2 = server._open_ticket_note(phone2)  # all of phone2's tickets are non-UUID
-assert note2 and "TKT-5005" in note2 and _calls == [], (note2, _calls)
+assert note2 and "פנייה" in note2 and _calls == [], (note2, _calls)
+assert "TKT-5005" not in note2, "ticket ids must stay out of the note"
 # a newer non-UUID ticket (fallback duplicate) must not mask an older
 # on-account UUID ticket's thread
 phone5 = "+972505556677"
@@ -461,7 +470,7 @@ assert "החשבון שוחרר" in note, "older UUID ticket's thread must still
 contact.SUGAR_ADMIN_API = ""
 _calls.clear()
 note = server._open_ticket_note(phone3)
-assert note and TICKET_UUID in note and _calls == [], "no admin config -> no fetch"
+assert note and "פנייה" in note and _calls == [], "no admin config -> no fetch"
 contact.SUGAR_ADMIN_API = "test-admin-token"
 print("15. note thread: labels, IL time, PII-redacted, fenced; cache reuse/drop; no UUID masking")
 

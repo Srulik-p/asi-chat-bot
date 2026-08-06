@@ -22,7 +22,7 @@ os.environ["USERS_DB_PATH"] = DB_PATH
 os.environ["OPENAI_API_KEY"] = "dummy-for-smoke-test"
 os.environ["AUTH_CALLBACK_SECRET"] = "smoke-secret"
 os.environ["INTERNAL_API_SECRET"] = "smoke-internal"
-os.environ["OUTBOUND_SEND_URL"] = ""  # notifier must no-op, not call anything real
+os.environ["WHATSAPP_API_URL"] = ""  # notifier must no-op, not call anything real
 os.environ["LOGIN_URL_BASE"] = "https://qa.sugardaddy.co.il/sign-in"
 
 from sugarbot import db  # noqa: E402

@@ -454,13 +454,15 @@ def submit_admin_ticket(
 
     # Mirrors the admin panel's manual-ticket payload. sourceNickname stays
     # empty on purpose: the backend resolves the account (and its current
-    # nickname) from userId, and our cached copy may be stale.
+    # nickname) from userId, and our cached copy may be stale. status
+    # "ForCustomerService" opens the ticket straight in the customer-service
+    # queue (instead of the untriaged "None" state).
     payload = {
         "userId": user_id,
         "sources": ["WhatsApp"],
         "reason": reason_id,
         "text": text or "",
-        "status": "None",
+        "status": "ForCustomerService",
         "sourcePhoneNumber": source_phone,
         "sourceNickname": "",
         "sourceEmail": source_email or "",
