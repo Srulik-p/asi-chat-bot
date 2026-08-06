@@ -1178,3 +1178,5 @@ def sweep_idle(
 async def healthz() -> dict:
     # async so health checks never queue behind the sync threadpool under load.
     return {"ok": True}
+
+# Deploy marker 2026-08-06: force a clean image rebuild (rev 00029 served stale code).
