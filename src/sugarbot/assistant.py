@@ -31,6 +31,12 @@ ROOT = Path(__file__).parent
 SYSTEM_PROMPT_PATH = ROOT / "system_prompt.md"
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+# Companion to OPENAI_MODEL, passed through as reasoning_effort when set.
+# The valid value depends on the model — gpt-5.6-terra only allows function
+# tools on /v1/chat/completions with an explicit reasoning_effort="none",
+# while gpt-5 rejects "none" — so it must travel with the model in deploy
+# env, never be hardcoded. Unset/empty -> the parameter is omitted.
+REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "").strip()
 # Behaviour instructions + the KB index. Both are static, so the whole system
 # prompt stays the cacheable prefix; the model reads topic files on demand via
 # the read_kb tool instead of carrying the full knowledge base every turn.
@@ -217,6 +223,8 @@ def reply(history: list[dict], user_message: str, stream: bool = True) -> tuple[
         kwargs: dict = {"model": MODEL, "messages": messages, "tools": TOOLS}
         if i == MAX_TOOL_ROUNDS - 1:
             kwargs["tool_choice"] = "none"
+        if REASONING_EFFORT:
+            kwargs["reasoning_effort"] = REASONING_EFFORT
 
         if stream:
             with client.chat.completions.stream(

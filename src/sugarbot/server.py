@@ -80,6 +80,7 @@ from sugarbot import contact, db, notifier
 from sugarbot.assistant import (
     MAX_TOOL_ROUNDS,
     MODEL,
+    REASONING_EFFORT,
     SYSTEM_PROMPT,
     TOOL_FNS,
     TOOLS,
@@ -928,6 +929,8 @@ def _run_chat_locked(
             kwargs: dict = {"model": MODEL, "messages": messages, "tools": TOOLS_ALL}
             if i == MAX_TOOL_ROUNDS - 1:
                 kwargs["tool_choice"] = "none"
+            if REASONING_EFFORT:
+                kwargs["reasoning_effort"] = REASONING_EFFORT
 
             # Buffer this round's content deltas instead of yielding them live:
             # a round that ends in tool_calls may still stream preamble text
