@@ -15,6 +15,7 @@ import json as _json
 import os
 import pathlib
 import tempfile
+import time as _time
 import uuid
 
 # Unique per run so concurrent executions (parallel CI shards / agents) don't
@@ -31,6 +32,9 @@ os.environ["OPENAI_API_KEY"] = "dummy-for-smoke-test"
 os.environ.pop("SUPPORT_TICKET_ENV", None)  # exercise the default (qa)
 os.environ.pop("SUGAR_ADMIN_API", None)  # admin path starts unconfigured
 os.environ.pop("SUPPORT_ADMIN_URL", None)
+os.environ.pop("ADMIN_EMAIL", None)  # managed-login creds start unconfigured
+os.environ.pop("ADMIN_PASSWORD", None)
+os.environ.pop("ADMIN_LOGIN_URL", None)
 
 from sugarbot import contact  # noqa: E402
 
@@ -271,6 +275,238 @@ res = contact.submit_admin_ticket(reason="help_desk", text="x", user_id="u", sou
 assert res["ok"] is False, res
 contact.requests.post = _fake_post
 print("10. submit_admin_ticket -> exact JSON payload + bearer; status 'None' normalized; failures handled")
+
+# 10b) managed admin login: ADMIN_EMAIL/ADMIN_PASSWORD -> lazy POST /auth/login,
+#      token cached until expiresAt, one re-login retry on 401, and safe
+#      fallbacks when the login endpoint itself is down
+_now_ms = int(_time.time() * 1000)
+
+# login URL derives from SUPPORT_ADMIN_URL; an explicit override wins
+assert contact._admin_login_url() == "https://admin.example/auth/login", contact._admin_login_url()
+contact.ADMIN_LOGIN_URL = "https://other.example/auth/login"
+assert contact._admin_login_url() == "https://other.example/auth/login"
+contact.ADMIN_LOGIN_URL = ""
+
+# creds alone (no static token) must enable the admin path
+contact.SUGAR_ADMIN_API = ""
+contact.ADMIN_EMAIL = "admin@example.com"
+contact.ADMIN_PASSWORD = "pw-secret"
+assert contact.admin_available(), "login creds alone must enable the admin path"
+
+# a base that doesn't end in /support cannot derive a login URL: managed login
+# is disabled (creds dead), a static token still carries the admin path
+_saved_admin_url = contact.SUPPORT_ADMIN_URL
+contact.SUPPORT_ADMIN_URL = "https://admin.example/api"
+assert contact._admin_login_url() == "", "non-/support base must not derive a login URL"
+assert not contact._login_available()
+assert not contact.admin_available(), "creds without a login URL must not enable the admin path"
+contact.SUGAR_ADMIN_API = "static-tok"
+assert contact.admin_available(), "static token still carries the admin path"
+contact.SUGAR_ADMIN_API = ""
+contact.SUPPORT_ADMIN_URL = _saved_admin_url
+
+_login_calls: list = []
+
+
+def _login_aware_post(url, files=None, json=None, headers=None, timeout=None):
+    if url.endswith("/auth/login"):
+        _login_calls.append(json)
+        return _FakeResp(
+            status_code=200,
+            reason="OK",
+            body={"token": "fresh-token-1", "expiresAt": _now_ms + 3_600_000},
+        )
+    _calls.append(
+        {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+    )
+    return _FakeResp(body=_next_body)
+
+
+contact.requests.post = _login_aware_post
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+_calls.clear()
+_next_body = {"id": "ADM-20", "status": "None"}
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="x", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and res["ticket_id"] == "ADM-20", res
+assert _login_calls == [{"email": "admin@example.com", "password": "pw-secret"}], _login_calls
+assert len(_calls) == 1, _calls
+assert _calls[0]["headers"] == {"Authorization": "Bearer fresh-token-1"}, _calls[0]["headers"]
+
+# second call reuses the cached token -> no extra login POST
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="y", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and len(_login_calls) == 1, (_login_calls, res)
+
+# expired cache -> re-login before the call
+contact._token_state["expires_at"] = _now_ms - 1
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="z", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and len(_login_calls) == 2, (_login_calls, res)
+assert _calls[-1]["headers"] == {"Authorization": "Bearer fresh-token-1"}, _calls[-1]["headers"]
+
+# a thread whose 401'd token was already replaced by a competing thread must
+# reuse the cached replacement, not re-login; only a still-cached stale token
+# forces a fresh login
+_login_calls.clear()
+contact._token_state.update(token="fresh-token-9", expires_at=_now_ms + 3_600_000, failed_until=0)
+assert contact._admin_token(stale_token="old-token") == "fresh-token-9"
+assert _login_calls == [], "cache already moved past the stale token -> no re-login"
+assert contact._admin_token(stale_token="fresh-token-9") == "fresh-token-1"
+assert len(_login_calls) == 1, "matching stale token must force a re-login"
+
+
+# a 401 mid-flight (token revoked server-side) -> one re-login + one retry
+def _401_then_ok_post(url, files=None, json=None, headers=None, timeout=None):
+    if url.endswith("/auth/login"):
+        _login_calls.append(json)
+        return _FakeResp(
+            status_code=200,
+            reason="OK",
+            body={"token": "fresh-token-2", "expiresAt": _now_ms + 3_600_000},
+        )
+    _calls.append(
+        {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+    )
+    if headers == {"Authorization": "Bearer fresh-token-2"}:
+        return _FakeResp(body={"id": "ADM-21", "status": "None"})
+    return _FakeResp(status_code=401, reason="Unauthorized")
+
+
+contact.requests.post = _401_then_ok_post
+_calls.clear()
+_login_calls.clear()
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="w", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and res["ticket_id"] == "ADM-21", res
+assert len(_login_calls) == 1, _login_calls
+assert [c["headers"]["Authorization"] for c in _calls] == [
+    "Bearer fresh-token-1",
+    "Bearer fresh-token-2",
+], _calls
+
+
+# login endpoint down -> handled ok=False (server then falls back to unauth), no loop
+def _login_down_post(url, files=None, json=None, headers=None, timeout=None):
+    if url.endswith("/auth/login"):
+        _login_calls.append(json)
+        return _FakeResp(status_code=500, reason="Server Error")
+    _calls.append(
+        {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+    )
+    return _FakeResp(status_code=401, reason="Unauthorized")
+
+
+contact.requests.post = _login_down_post
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+_calls.clear()
+_login_calls.clear()
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="v", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is False, res
+assert len(_login_calls) == 1, f"exactly one login attempt per call: {_login_calls}"
+assert _calls == [], f"no admin POST without a bearer: {_calls}"
+# the failure is negative-cached: an immediate retry must not hit login again
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="v2", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is False and len(_login_calls) == 1, (_login_calls, res)
+
+# login down but a static token configured -> the ticket still files on-account
+# with the static bearer (the documented fallback)
+def _login_down_admin_ok_post(url, files=None, json=None, headers=None, timeout=None):
+    if url.endswith("/auth/login"):
+        _login_calls.append(json)
+        return _FakeResp(status_code=500, reason="Server Error")
+    _calls.append(
+        {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+    )
+    return _FakeResp(body=_next_body)
+
+
+contact.requests.post = _login_down_admin_ok_post
+contact.SUGAR_ADMIN_API = "static-fallback-token"
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+_calls.clear()
+_login_calls.clear()
+_next_body = {"id": "ADM-30", "status": "None"}
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="u", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and res["ticket_id"] == "ADM-30", res
+assert len(_login_calls) == 1, _login_calls
+assert _calls[-1]["headers"] == {"Authorization": "Bearer static-fallback-token"}, _calls[-1]
+contact.SUGAR_ADMIN_API = ""
+
+# malformed login responses (proxy error pages, API drift) and a raising login
+# POST must all come back as handled ok=False — never an exception, never an
+# admin POST with a junk bearer
+for _bad_body in (["Bad Gateway"], {"user": "x"}, {"token": ""}, {"token": 42}, None):
+
+    def _login_junk_post(url, files=None, json=None, headers=None, timeout=None, _b=_bad_body):
+        if url.endswith("/auth/login"):
+            return _FakeResp(status_code=200, reason="OK", body=_b)
+        _calls.append(
+            {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+        )
+        return _FakeResp(status_code=401, reason="Unauthorized")
+
+    contact.requests.post = _login_junk_post
+    contact._token_state.update(token="", expires_at=0, failed_until=0)
+    _calls.clear()
+    res = contact.submit_admin_ticket(
+        reason="help_desk", text="t", user_id="site-uuid-1", source_phone="+972501234567"
+    )
+    assert res["ok"] is False, (_bad_body, res)
+    assert _calls == [], f"junk login body must not produce an admin POST: {_calls}"
+
+
+def _login_raises_post(url, files=None, json=None, headers=None, timeout=None):
+    if url.endswith("/auth/login"):
+        raise contact.requests.ConnectionError("login boom")
+    _calls.append(
+        {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+    )
+    return _FakeResp(status_code=401, reason="Unauthorized")
+
+
+contact.requests.post = _login_raises_post
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+_calls.clear()
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="s", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is False, res
+assert _calls == [], _calls
+
+# the thread fetch uses the managed token too
+contact.requests.post = _login_aware_post
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+_calls.clear()
+_login_calls.clear()
+_next_body = {"data": [{"id": "m1", "text": "hi"}], "totalItems": 1}
+res = contact.fetch_admin_ticket_messages("ADM-20")
+assert res["ok"] is True and res["total"] == 1, res
+assert len(_login_calls) == 1, _login_calls
+assert _calls[-1]["headers"] == {"Authorization": "Bearer fresh-token-1"}, _calls[-1]["headers"]
+
+# the managed token and the password are masked in error details
+contact._token_state["token"] = "tok-live"
+masked = contact._safe_err(Exception("boom tok-live pw-secret"))
+assert "tok-live" not in masked and "pw-secret" not in masked and "***" in masked, masked
+
+# restore the static-token setup the sections below expect
+contact.ADMIN_EMAIL = ""
+contact.ADMIN_PASSWORD = ""
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+contact.SUGAR_ADMIN_API = "test-admin-token"
+contact.requests.post = _fake_post
+print("10b. managed login: lazy login+cache, expiry refresh, 401 retry, login-down fallback, thread fetch, masking")
 
 # 11) server routing: linked account -> admin path (on_account); anonymous -> unauth
 phone2 = "+972502223344"

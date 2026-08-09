@@ -29,8 +29,19 @@ Env configuration (all optional):
   SUPPORT_TICKET_ORIGIN    override the Origin header
   SUPPORT_TICKET_REFERER   override the Referer header
   SUPPORT_TICKET_TIMEOUT   request timeout in seconds (default 10)
-  SUGAR_ADMIN_API          bearer token for the admin backend; unset ->
-                           admin path unavailable (anonymous filing only)
+  SUGAR_ADMIN_API          static bearer token for the admin backend; used
+                           as-is when no login credentials are set, and as
+                           a fallback when login fails
+  ADMIN_EMAIL              admin-panel login credentials. When both are set
+  ADMIN_PASSWORD           the bot manages its own bearer: it POSTs
+                           {email, password} to /auth/login, caches the
+                           returned token until shortly before expiresAt,
+                           and re-logins once on a 401. Unset both AND
+                           SUGAR_ADMIN_API -> admin path unavailable
+                           (anonymous filing only)
+  ADMIN_LOGIN_URL          override the login endpoint (default: derived
+                           from SUPPORT_ADMIN_URL by swapping /support
+                           for /auth/login)
   SUPPORT_ADMIN_URL        override the admin support endpoint (default
                            per SUPPORT_TICKET_ENV; prod default is empty
                            until the prod admin host is known; an empty
@@ -59,6 +70,8 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
 import uuid
 
 import requests
@@ -113,6 +126,33 @@ SUPPORT_ADMIN_URL = (
     .rstrip("/")
 )
 SUPPORT_ADMIN_TIMEOUT = float(os.getenv("SUPPORT_ADMIN_TIMEOUT", "3"))
+
+# Admin-panel login credentials. When set, the bearer token is obtained from
+# POST /auth/login and refreshed automatically (the static SUGAR_ADMIN_API
+# tokens the panel issues expire, which used to silently demote every ticket
+# to the anonymous path once the pasted token aged out).
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+ADMIN_LOGIN_URL = (os.getenv("ADMIN_LOGIN_URL") or "").strip().rstrip("/")
+if ADMIN_EMAIL and ADMIN_PASSWORD and not ADMIN_LOGIN_URL and not SUPPORT_ADMIN_URL.endswith("/support"):
+    # Without this warning the creds would be silently dead (no login URL to
+    # derive) and every recognized user's ticket would quietly file anonymously.
+    print(
+        "[contact] ADMIN_EMAIL/ADMIN_PASSWORD set but no login URL: "
+        "SUPPORT_ADMIN_URL does not end in /support and ADMIN_LOGIN_URL is "
+        "unset; managed bearer disabled — set ADMIN_LOGIN_URL",
+        file=sys.stderr,
+    )
+
+# Managed token cache: expires_at is the login response's epoch-ms expiresAt
+# (0 = unknown -> trust the token until a 401 forces a refresh); failed_until
+# negative-caches a failed login (epoch seconds) so a login outage costs one
+# attempt per cooldown window instead of two per chat turn. The lock keeps
+# concurrent chat threads from stampeding the login endpoint.
+_token_lock = threading.Lock()
+_token_state = {"token": "", "expires_at": 0, "failed_until": 0.0}
+_TOKEN_SLACK_MS = 60_000  # refresh this long before expiresAt
+_LOGIN_COOLDOWN_S = 30.0  # don't re-attempt login for this long after a failure
 
 # Friendly, stable key -> ContactUsReason optionId, per environment. Keys are
 # what the model passes; the UUIDs are what the backend requires. QA and prod
@@ -271,11 +311,12 @@ def _result(
 
 
 def _safe_err(e: Exception) -> str:
-    """Format an exception for logs/details with the admin token masked —
+    """Format an exception for logs/details with admin secrets masked —
     some requests exceptions (e.g. InvalidHeader) embed the header value."""
     s = f"{type(e).__name__}: {e}"
-    if SUGAR_ADMIN_API:
-        s = s.replace(SUGAR_ADMIN_API, "***")
+    for secret in (SUGAR_ADMIN_API, _token_state["token"], ADMIN_PASSWORD):
+        if secret:
+            s = s.replace(secret, "***")
     return s
 
 
@@ -287,12 +328,20 @@ def _send_ticket_request(
     json_body: dict | None = None,
     headers: dict | None = None,
     timeout: float | None = None,
+    admin_auth: bool = False,
 ) -> dict:
     """POST a help-desk submit request and parse the ticket response.
 
-    Shared tail for both senders so their behavior can't drift. Never raises."""
+    Shared tail for both senders so their behavior can't drift. Never raises.
+    With admin_auth=True the request goes through _admin_post (managed bearer
+    + one re-login retry on 401) and `headers` is ignored."""
     try:
-        resp = requests.post(url, files=files, json=json_body, headers=headers, timeout=timeout)
+        if admin_auth:
+            resp = _admin_post(url, json_body=json_body, timeout=timeout)
+        else:
+            resp = requests.post(
+                url, files=files, json=json_body, headers=headers, timeout=timeout
+            )
     except requests.RequestException as e:
         print(f"[contact] {kind} failed: {_safe_err(e)}", file=sys.stderr)
         return _result(False, detail=_safe_err(e))
@@ -375,13 +424,123 @@ def submit_ticket(
     )
 
 
+def _admin_login_url() -> str:
+    """Login endpoint for the managed bearer. Explicit override wins;
+    otherwise derived from SUPPORT_ADMIN_URL (…/support -> …/auth/login)."""
+    if ADMIN_LOGIN_URL:
+        return ADMIN_LOGIN_URL
+    if SUPPORT_ADMIN_URL.endswith("/support"):
+        return SUPPORT_ADMIN_URL[: -len("/support")] + "/auth/login"
+    return ""
+
+
+def _login_available() -> bool:
+    return bool(ADMIN_EMAIL and ADMIN_PASSWORD and _admin_login_url())
+
+
+def _admin_login() -> str:
+    """POST /auth/login and cache the returned bearer. Returns "" on failure.
+
+    Callers hold _token_lock. Never raises; a failure is negative-cached for
+    _LOGIN_COOLDOWN_S and leaves the static-token / anonymous fallbacks to do
+    their job.
+    """
+    def _failed(msg: str) -> str:
+        print(f"[contact] admin login {msg}", file=sys.stderr)
+        _token_state["failed_until"] = time.time() + _LOGIN_COOLDOWN_S
+        return ""
+
+    try:
+        resp = requests.post(
+            _admin_login_url(),
+            json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+            timeout=SUPPORT_ADMIN_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return _failed(f"failed: {_safe_err(e)}")
+    if not resp.ok:
+        return _failed(f"HTTP {resp.status_code}")
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    token = body.get("token") if isinstance(body, dict) else None
+    if not isinstance(token, str) or not token:
+        return _failed("returned no token")
+    expires = body.get("expiresAt")
+    _token_state["token"] = token
+    _token_state["expires_at"] = expires if isinstance(expires, (int, float)) else 0
+    _token_state["failed_until"] = 0.0
+    return token
+
+
+def _admin_token(stale_token: str = "") -> str:
+    """Current bearer for the admin API.
+
+    With login credentials configured the token comes from /auth/login and is
+    cached until _TOKEN_SLACK_MS before expiresAt; without them the static
+    SUGAR_ADMIN_API is used as-is (its expiry shows up as a 401 -> the caller
+    falls back to the anonymous path, as before).
+
+    `stale_token` is the token a caller just saw 401: a login happens only if
+    the cache still holds that exact token — if a competing thread already
+    replaced it, the cached replacement is returned instead of stampeding the
+    login endpoint (and risking a needless failure while a valid token sits
+    in the cache).
+    """
+    if not _login_available():
+        return SUGAR_ADMIN_API
+    with _token_lock:
+        token = _token_state["token"]
+        expires_at = _token_state["expires_at"]
+        fresh = token and (
+            not expires_at or time.time() * 1000 < expires_at - _TOKEN_SLACK_MS
+        )
+        if fresh and token != stale_token:
+            return token
+        if time.time() < _token_state["failed_until"]:
+            return SUGAR_ADMIN_API
+        return _admin_login() or SUGAR_ADMIN_API
+
+
+def _admin_post(url: str, *, json_body: dict, timeout: float):
+    """POST to the admin API with the managed bearer; one re-login retry on
+    401 (token revoked/expired server-side despite a fresh-looking cache).
+
+    Raises requests.RequestException like a plain post — callers already
+    handle that, including the fail-fast when no bearer could be obtained
+    at all (login down, no static token): posting "Bearer " would only add
+    a guaranteed-401 round trip on the chat hot path.
+    """
+    token = _admin_token()
+    if not token:
+        raise requests.RequestException("no admin bearer available")
+    resp = requests.post(
+        url,
+        json=json_body,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=timeout,
+    )
+    if resp.status_code == 401 and _login_available():
+        fresh = _admin_token(stale_token=token)
+        if fresh and fresh != token:
+            resp = requests.post(
+                url,
+                json=json_body,
+                headers={"Authorization": f"Bearer {fresh}"},
+                timeout=timeout,
+            )
+    return resp
+
+
 def admin_available() -> bool:
-    """True when the admin (on-account) ticket path is configured.
+    """True when the admin (on-account) ticket path is configured — either a
+    static token or login credentials.
 
     Reads the module globals at call time so tests (and future hot config)
-    can swap SUGAR_ADMIN_API / SUPPORT_ADMIN_URL after import.
+    can swap SUGAR_ADMIN_API / SUPPORT_ADMIN_URL / creds after import.
     """
-    return bool(SUGAR_ADMIN_API and SUPPORT_ADMIN_URL)
+    return bool(SUPPORT_ADMIN_URL and (SUGAR_ADMIN_API or _login_available()))
 
 
 def _messages_result(ok: bool, *, total=None, messages: list | None = None, detail: str = "") -> dict:
@@ -402,10 +561,9 @@ def fetch_admin_ticket_messages(ticket_id: str, *, limit: int = 50, page: int = 
 
     url = f"{SUPPORT_ADMIN_URL}/{ticket_id}/messages/list"
     try:
-        resp = requests.post(
+        resp = _admin_post(
             url,
-            json={"pagination": {"limit": limit, "page": page}},
-            headers={"Authorization": f"Bearer {SUGAR_ADMIN_API}"},
+            json_body={"pagination": {"limit": limit, "page": page}},
             timeout=SUPPORT_ADMIN_TIMEOUT,
         )
     except requests.RequestException as e:
@@ -474,6 +632,6 @@ def submit_admin_ticket(
         "admin ticket",
         SUPPORT_ADMIN_URL,
         json_body=payload,
-        headers={"Authorization": f"Bearer {SUGAR_ADMIN_API}"},
         timeout=SUPPORT_ADMIN_TIMEOUT,
+        admin_auth=True,
     )
