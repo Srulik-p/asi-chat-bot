@@ -43,9 +43,8 @@ Env configuration (all optional):
                            from SUPPORT_ADMIN_URL by swapping /support
                            for /auth/login)
   SUPPORT_ADMIN_URL        override the admin support endpoint (default
-                           per SUPPORT_TICKET_ENV; prod default is empty
-                           until the prod admin host is known; an empty
-                           override falls back to the env default)
+                           per SUPPORT_TICKET_ENV; an empty override
+                           falls back to the env default)
   SUPPORT_ADMIN_TIMEOUT    admin request timeout in seconds (default 3 —
                            deliberately short: the anonymous fallback
                            covers admin failures, and the thread fetch
@@ -106,12 +105,12 @@ SUPPORT_TICKET_REFERER = os.getenv(
 )
 SUPPORT_TICKET_TIMEOUT = float(os.getenv("SUPPORT_TICKET_TIMEOUT", "10"))
 
-# Admin help-desk API — files a ticket ON a signed-in user's account. The prod
-# admin host is unknown until launch, so prod defaults to "" (admin path
-# unavailable -> callers fall back to the anonymous unauth endpoint).
+# Admin help-desk API — files a ticket ON a signed-in user's account. Like the
+# unauth endpoints above, QA and prod are separate backends; the /auth/login
+# endpoint is derived from these by _admin_login_url (…/support -> /auth/login).
 _ADMIN_ENV_DEFAULTS = {
     "qa": {"url": "https://backend-admin.sugarinter.media/support"},
-    "prod": {"url": ""},
+    "prod": {"url": "https://adm-backend.sugarinter.media/support"},
 }
 # Whitespace-collapsed, not just stripped: a line-wrapped copy-paste would
 # otherwise break the Authorization header, and requests' InvalidHeader error

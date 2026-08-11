@@ -218,7 +218,9 @@ print("8. server.TOOLS_ALL registers submit_support_ticket; phone not a model ar
 assert (
     contact._ADMIN_ENV_DEFAULTS["qa"]["url"] == "https://backend-admin.sugarinter.media/support"
 ), contact._ADMIN_ENV_DEFAULTS
-assert contact._ADMIN_ENV_DEFAULTS["prod"]["url"] == "", "prod admin host unknown until launch"
+assert (
+    contact._ADMIN_ENV_DEFAULTS["prod"]["url"] == "https://adm-backend.sugarinter.media/support"
+), contact._ADMIN_ENV_DEFAULTS
 assert contact.SUGAR_ADMIN_API == "" and not contact.admin_available()
 _calls.clear()
 res = contact.submit_admin_ticket(
