@@ -209,6 +209,7 @@ params = tool["function"]["parameters"]
 assert params["properties"]["reason"]["enum"] == contact.REASON_CHOICES, params
 assert params["required"] == ["reason", "text"], params
 assert "phone" not in params["properties"] and "sourcePhoneNumber" not in params["properties"]
+assert "no_account" in params["properties"], "guest filing needs the explicit no_account flag"
 for key in ("stop_payment", "id_verification", "photo_verification"):
     assert key in params["properties"]["reason"]["enum"], key
 print("8. server.TOOLS_ALL registers submit_support_ticket; phone not a model arg; new reasons in enum")
@@ -523,12 +524,31 @@ rows = db.recent_support_tickets(phone2)
 assert rows and rows[0]["ticket_id"] == "ADM-2", rows
 _calls.clear()
 _next_body = {"id": "TKT-3003", "status": "open"}
+# anonymous conversation WITHOUT no_account -> no ticket yet: ask to log in first
 result = server._submit_ticket_for("+972509998877", {"reason": "technical", "text": "תקלה"})
+parsed = _json.loads(result)
+assert parsed["submitted"] is False and parsed.get("login_required") is True, parsed
+assert parsed["login_url"].startswith(server.LOGIN_URL_BASE), parsed
+assert parsed["instructions"], parsed
+assert _calls == [], "must not POST before the customer had a chance to log in"
+assert db.recent_support_tickets("+972509998877") == [], "nothing persisted on login gate"
+# schema-loose models sometimes emit booleans as strings - "false" must fail
+# closed into the gate, not bool()-truthy into a guest ticket
+result = server._submit_ticket_for(
+    "+972509998877", {"reason": "technical", "text": "תקלה", "no_account": "false"}
+)
+parsed = _json.loads(result)
+assert parsed["submitted"] is False and parsed.get("login_required") is True, parsed
+assert _calls == [], _calls
+# customer has no account / can't log in -> explicit no_account files a guest ticket
+result = server._submit_ticket_for(
+    "+972509998877", {"reason": "technical", "text": "תקלה", "no_account": True}
+)
 parsed = _json.loads(result)
 assert parsed["submitted"] is True and parsed["on_account"] is False, parsed
 assert len(_calls) == 1 and _calls[0]["url"] == contact.SUPPORT_TICKET_URL, _calls
 assert _calls[0]["files"] is not None, "anonymous path must stay multipart"
-print("11. routing: linked -> admin (on_account=true, persisted); anonymous -> unauth multipart")
+print("11. routing: linked -> admin; anonymous -> login gate, then unauth only with no_account")
 
 # 12) admin failure -> unauth fallback (customer always gets a ticket);
 #     missing token -> admin never attempted

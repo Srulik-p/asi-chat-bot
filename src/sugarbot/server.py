@@ -368,9 +368,12 @@ ACCOUNT_TOOLS = [
                 "(e.g. 'do I have a subscription?', 'am I premium?', 'what's my "
                 "status?', 'why can't I send messages?'), AND whenever you need a "
                 "login link to send the customer for ANY purpose — status checks, "
-                "identification for blocked/suspended accounts, or reports. The "
-                "login_url field this tool returns is the ONLY valid login link; "
-                "never invent one. Returns logged_in plus, if logged in, the "
+                "identification for blocked/suspended accounts, or reports. Valid "
+                "login links come ONLY from a login_url field returned by this "
+                "tool or by submit_support_ticket's login_required response — "
+                "never invent one, and if submit_support_ticket just returned a "
+                "login_url, send that link instead of calling this tool again. "
+                "Returns logged_in plus, if logged in, the "
                 "membership details (nickname, is_premium, gender, labels); if not "
                 "logged in, a login_url to send the customer so they can sign in. "
                 "It does NOT return subscription dates — never invent an end/renewal "
@@ -423,7 +426,10 @@ CONTACT_TOOLS = [
                 "customer accepted your offer to open a ticket. Use "
                 "reason='help_desk' for a plain 'I want to talk to a rep' request, "
                 "otherwise the closest category. Pair it with escalate_to_human "
-                "(which marks the conversation awaiting a rep). Do NOT use it for "
+                "(which marks the conversation awaiting a rep) — but only when a "
+                "ticket is actually filed: on a login_required result nothing was "
+                "filed yet, so do not call escalate_to_human until the retry "
+                "(after login, or with no_account=true) succeeds. Do NOT use it for "
                 "questions you can answer yourself from the knowledge base, and for "
                 "irreversible actions (e.g. account removal) only after the customer "
                 "has explicitly confirmed. Provide `text` (a clear Hebrew summary of "
@@ -434,7 +440,13 @@ CONTACT_TOOLS = [
                 "attached to the customer's site account and the team sees their "
                 "details — no email needed to identify them; on_account=false means "
                 "it was filed anonymously with the phone (plus the customer's email "
-                "if they provided one). After a successful submit, tell the "
+                "if they provided one). If the conversation is not linked to a site "
+                "account yet, the tool files nothing and returns login_required=true "
+                "with a login_url: ask the customer to log in via that link first "
+                "(so the ticket lands on their account), then call again after they "
+                "logged in. Only if the customer says they have no account, or tried "
+                "and could not log in, call again with no_account=true to file "
+                "anonymously. After a successful submit, tell the "
                 "customer a human representative will get back to them during "
                 "working hours. Never give the customer a ticket number or id."
             ),
@@ -462,6 +474,15 @@ CONTACT_TOOLS = [
                     "email": {
                         "type": "string",
                         "description": "Customer email, only if they provided one. Optional.",
+                    },
+                    "no_account": {
+                        "type": "boolean",
+                        "description": (
+                            "Set true ONLY after the customer said they have no "
+                            "site account, or tried to log in and could not — "
+                            "files the ticket anonymously (guest). Never set it "
+                            "on your own initiative to skip the login step."
+                        ),
                     },
                 },
                 "required": ["reason", "text"],
@@ -730,24 +751,60 @@ def _submit_ticket_for(phone: str, args: dict) -> str:
 
     Routing: a conversation linked to a site account (users.external_id exists —
     any age; the 72h freshness window only gates get_account_status) files the
-    ticket ON the account via the admin API. Anonymous conversations, and any
-    admin-path failure, use the unauth contact-form endpoint so the customer
-    always ends up with a ticket. The phone comes from the conversation
-    identity (kept out of the model), attached as sourcePhoneNumber.
+    ticket ON the account via the admin API. An unlinked conversation gets a
+    login gate first: the tool files nothing and returns login_required with a
+    login_url, so the customer can log in and the ticket lands on their account
+    (with their userId). Only an explicit no_account=true from the model — the
+    customer said they have no account or could not log in — files anonymously.
+    Admin-path failures still fall back to the unauth contact-form endpoint so
+    a logged-in customer always ends up with a ticket. The phone comes from the
+    conversation identity (kept out of the model), attached as sourcePhoneNumber.
     """
     reason = args.get("reason", "")
     text = args.get("text", "")
     email = args.get("email") or None
+    # Schemas are not strict-mode, so the model may emit the boolean as a JSON
+    # string; "false"/"no" must fail closed into the login gate, not bool()-true.
+    no_account = args.get("no_account", False)
+    if isinstance(no_account, str):
+        no_account = no_account.strip().lower() in ("true", "1", "yes")
+    no_account = bool(no_account)
 
     external_id = None
+    lookup_failed = False
     try:
         user = db.get_user_by_phone(phone)
         external_id = (user or {}).get("external_id") or None
     except Exception as e:
-        # A DB hiccup must not block filing anonymously.
+        # A DB hiccup must not block filing anonymously (and the login gate
+        # below would be pointless — the callback row could not be read anyway).
+        lookup_failed = True
         print(
             f"[chat] user lookup failed for {phone}: {type(e).__name__}: {e}",
             file=sys.stderr,
+        )
+
+    if external_id is None and not no_account and not lookup_failed:
+        # Same phone-in-URL exception as _not_logged_in: the sign-in contract
+        # needs it, and the prompt forbids the model from quoting it.
+        login_url = f"{LOGIN_URL_BASE}?phoneNumber={quote(phone, safe='')}"
+        instructions = (
+            "הפנייה עוד לא נפתחה. הלקוח לא מחובר לחשבון אתר, ופנייה שנפתחת על "
+            "החשבון מזהה אותו לצוות אוטומטית. בקש/י ממנו להתחבר קודם, ושלח/י לו "
+            "את הערך של השדה login_url (כתובת ה-URL המלאה) כקישור לחיץ - אל "
+            "תכתוב/י את המילה 'login_url' או סוגריים. אחרי שהתחבר, קרא/י לכלי "
+            "שוב והפנייה תיפתח על החשבון. רק אם הלקוח אומר שאין לו חשבון, או "
+            "שניסה ולא הצליח להתחבר - קרא/י לכלי שוב עם no_account=true "
+            "והפנייה תיפתח אנונימית."
+        )
+        return json.dumps(
+            {
+                "submitted": False,
+                "login_required": True,
+                "login_url": login_url,
+                "instructions": instructions,
+            },
+            ensure_ascii=False,
         )
 
     res = None
@@ -918,11 +975,18 @@ def _run_chat_locked(
         messages.insert(1, {"role": "system", "content": ticket_note})
 
     total = empty_usage()
-    # Safety-net for Remark 12 ("login link often not sent"): whenever
-    # get_account_status resolves to a not-logged-in status with a login_url, we
-    # remember it and guarantee the literal URL ends up in the reply even if the
-    # model forgets to include it.
+    # Safety-net for Remark 12 ("login link often not sent"): whenever a tool
+    # resolves to a not-logged-in status with a login_url — get_account_status,
+    # or submit_support_ticket's login gate — we remember it and guarantee the
+    # literal URL ends up in the reply even if the model forgets to include it.
     pending_login_url: str | None = None
+    # Escalation is deferred to the end of the turn: pairing escalate_to_human
+    # with a login-GATED ticket (nothing filed) must not flag the conversation
+    # as awaiting a rep — an escalated row is excluded from the idle sweep and
+    # would sit open forever with no ticket in any queue.
+    escalate_requested = False
+    ticket_gated = False
+    ticket_filed = False
 
     try:
         for i in range(MAX_TOOL_ROUNDS):
@@ -983,11 +1047,23 @@ def _run_chat_locked(
                             except (json.JSONDecodeError, AttributeError):
                                 pass
                         elif name == "escalate_to_human":
-                            db.mark_escalated(phone, datetime.now(timezone.utc))
+                            escalate_requested = True
                             result = json.dumps({"escalated": True}, ensure_ascii=False)
                         elif name == "submit_support_ticket":
                             args = json.loads(tc.function.arguments or "{}")
                             result = _submit_ticket_for(phone, args)
+                            try:
+                                parsed = json.loads(result)
+                                if parsed.get("login_required"):
+                                    ticket_gated = True
+                                    pending_login_url = parsed.get("login_url")
+                                elif parsed.get("submitted"):
+                                    ticket_filed = True
+                                    # A filed ticket must not get a stray login
+                                    # link appended by the safety net.
+                                    pending_login_url = None
+                            except (json.JSONDecodeError, AttributeError):
+                                pass
                         else:
                             fn = TOOL_FNS.get(name)
                             if fn is None:
@@ -1053,6 +1129,19 @@ def _run_chat_locked(
         )
         traceback.print_exc()
         yield {"type": "error", "message": "אירעה תקלה זמנית. אפשר לנסות שוב בעוד רגע.", "ref": ref}
+    finally:
+        # Deferred from the dispatch loop: mark "awaiting a rep" only when the
+        # turn actually filed a ticket, or never gated one. A gated-and-not-
+        # filed turn stays un-escalated (and sweepable); the filing turn after
+        # the customer logs in (or says no account) re-pairs the escalation.
+        if escalate_requested and (ticket_filed or not ticket_gated):
+            try:
+                db.mark_escalated(phone, datetime.now(timezone.utc))
+            except Exception as e:
+                print(
+                    f"[chat] mark_escalated failed for {phone}: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
 
 
 def _ndjson(events: Iterator[dict]) -> Iterator[bytes]:
