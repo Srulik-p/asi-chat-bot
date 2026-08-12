@@ -11,12 +11,14 @@ handling, that the tool is registered in the server's tool list, and the
 admin (on-account) path: JSON payload + bearer auth, server-side routing for
 account-linked conversations, and fallback to the anonymous unauth endpoint.
 """
+import io as _io
 import json as _json
 import os
 import pathlib
 import tempfile
 import time as _time
 import uuid
+from contextlib import redirect_stderr as _redirect_stderr
 
 # Unique per run so concurrent executions (parallel CI shards / agents) don't
 # race each other on a shared SQLite file.
@@ -35,16 +37,18 @@ os.environ.pop("SUPPORT_ADMIN_URL", None)
 os.environ.pop("ADMIN_EMAIL", None)  # managed-login creds start unconfigured
 os.environ.pop("ADMIN_PASSWORD", None)
 os.environ.pop("ADMIN_LOGIN_URL", None)
+os.environ.pop("ADMIN_API_KEY", None)  # x-api-key auth starts unconfigured
 
 from sugarbot import contact  # noqa: E402
 
 
 class _FakeResp:
-    def __init__(self, status_code=201, reason="Created", body=None):
+    def __init__(self, status_code=201, reason="Created", body=None, text=""):
         self.status_code = status_code
         self.reason = reason
         self.ok = 200 <= status_code < 300
         self._body = body
+        self.text = text
 
     def json(self):
         if self._body is None:
@@ -664,6 +668,115 @@ assert len(_login_calls) == 1, _login_calls
 db.load_admin_token, db.save_admin_token = _saved_load, _saved_save
 db.save_admin_token("", 0)
 print("10c. persisted admin token: cold-start reuse, expired -> relogin, peer-refresh adoption, db-down resilience")
+
+
+# 10d) a failed login logs the endpoint, the email and the response body (so a
+# Cloudflare/WAF block is distinguishable from a credential rejection) — but
+# NEVER the password: Cloud Logging is readable by anyone with viewer access,
+# and a credential leaked there has to be rotated
+def _login_403_post(url, files=None, json=None, headers=None, timeout=None):
+    if url.endswith("/auth/login"):
+        _login_calls.append(json)
+        return _FakeResp(
+            status_code=403,
+            reason="Forbidden",
+            text="<html>error 1020  Cloudflare\nRay ID: abc pw-secret</html>",
+        )
+    _calls.append(
+        {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+    )
+    return _FakeResp(body=_next_body)
+
+
+contact.requests.post = _login_403_post
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+db.save_admin_token("", 0)
+_login_calls.clear()
+_err = _io.StringIO()
+with _redirect_stderr(_err):
+    assert contact._admin_login() == ""
+_logged = _err.getvalue()
+assert "pw-secret" not in _logged, f"password must never be logged: {_logged}"
+assert "https://admin.example/auth/login" in _logged, _logged
+assert "admin@example.com" in _logged, _logged
+assert "403" in _logged and "Cloudflare" in _logged, _logged
+assert "\n" not in _logged.strip(), "one log line per failure (body is collapsed)"
+
+# a network-level login failure names the endpoint too
+contact.requests.post = _login_raises_post
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+_err = _io.StringIO()
+with _redirect_stderr(_err):
+    assert contact._admin_login() == ""
+_logged = _err.getvalue()
+assert "https://admin.example/auth/login" in _logged and "login boom" in _logged, _logged
+assert "pw-secret" not in _logged, _logged
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+print("10d. login failures log endpoint + email + body snippet; password never logged")
+
+# 10e) ADMIN_API_KEY: the admin endpoints authenticate with a static
+# x-api-key header — no login, no token lifecycle. It wins over the login
+# creds when both are set, so the managed login stays in the tree but inert.
+contact.ADMIN_API_KEY = "key-abc-123"
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+db.save_admin_token("", 0)
+contact.requests.post = _login_aware_post
+_calls.clear()
+_login_calls.clear()
+_next_body = {"id": "ADM-40", "status": "None"}
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="k", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and res["ticket_id"] == "ADM-40", res
+assert _login_calls == [], "api key must not trigger a login"
+assert _calls[0]["headers"] == {"x-api-key": "key-abc-123"}, _calls[0]["headers"]
+assert db.load_admin_token() in (None, {"token": "", "expires_at": 0}), "no token to persist"
+
+# the thread fetch uses the same header
+_calls.clear()
+_next_body = {"data": [{"id": "m1", "text": "hi"}], "totalItems": 1}
+res = contact.fetch_admin_ticket_messages("ADM-40")
+assert res["ok"] is True and res["total"] == 1, res
+assert _calls[-1]["headers"] == {"x-api-key": "key-abc-123"}, _calls[-1]["headers"]
+
+# a 403 is final: no token to refresh, so no retry (and no login)
+_calls.clear()
+_login_calls.clear()
+contact.requests.post = _login_403_post  # non-login URLs return _next_body...
+_next_body = None
+
+
+def _apikey_403_post(url, files=None, json=None, headers=None, timeout=None):
+    if url.endswith("/auth/login"):
+        _login_calls.append(json)
+        return _FakeResp(status_code=200, reason="OK", body={"token": "t", "expiresAt": 0})
+    _calls.append(
+        {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+    )
+    return _FakeResp(status_code=403, reason="Forbidden", text='{"message":"Forbidden key-abc-123"}')
+
+
+contact.requests.post = _apikey_403_post
+_err = _io.StringIO()
+with _redirect_stderr(_err):
+    res = contact.submit_admin_ticket(
+        reason="help_desk", text="k", user_id="site-uuid-1", source_phone="+972501234567"
+    )
+assert res["ok"] is False and res["http_status"] == 403, res
+assert len(_calls) == 1, "no retry without a token lifecycle"
+assert _login_calls == [], "api key mode must never log in"
+assert "key-abc-123" not in _err.getvalue(), f"api key must be masked: {_err.getvalue()}"
+
+# the api key alone enables the admin path (no creds, no static token)
+_saved_email, _saved_pw = contact.ADMIN_EMAIL, contact.ADMIN_PASSWORD
+contact.ADMIN_EMAIL = contact.ADMIN_PASSWORD = ""
+contact.SUGAR_ADMIN_API = ""
+assert contact.admin_available(), "ADMIN_API_KEY alone must enable the admin path"
+assert not contact._login_available()
+contact.ADMIN_EMAIL, contact.ADMIN_PASSWORD = _saved_email, _saved_pw
+assert "key-abc-123" not in contact._safe_err(Exception("boom key-abc-123")), "masked"
+contact.ADMIN_API_KEY = ""
+print("10e. ADMIN_API_KEY: x-api-key header, no login, no retry, masked in logs")
 
 # restore the static-token setup the sections below expect
 contact.ADMIN_EMAIL = ""

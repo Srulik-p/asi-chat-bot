@@ -9,8 +9,9 @@ The form posts `multipart/form-data` to the "unauth" support endpoint.
 
 There is a second, authenticated path: when the customer's WhatsApp number is
 linked to a site account (we know their userId), `submit_admin_ticket` files
-the ticket ON that account via the admin backend (JSON POST with a bearer
-token), so the team sees it attached to the user instead of anonymous.
+the ticket ON that account via the admin backend (JSON POST authenticated
+with ADMIN_API_KEY as an `x-api-key` header), so the team sees it attached
+to the user instead of anonymous.
 The same admin backend also serves a ticket's message thread
 (`fetch_admin_ticket_messages`), which the server surfaces to the assistant
 so it can quote the team's actual reply instead of a generic "it's with the
@@ -29,16 +30,21 @@ Env configuration (all optional):
   SUPPORT_TICKET_ORIGIN    override the Origin header
   SUPPORT_TICKET_REFERER   override the Referer header
   SUPPORT_TICKET_TIMEOUT   request timeout in seconds (default 10)
-  SUGAR_ADMIN_API          static bearer token for the admin backend; used
-                           as-is when no login credentials are set, and as
-                           a fallback when login fails
-  ADMIN_EMAIL              admin-panel login credentials. When both are set
-  ADMIN_PASSWORD           the bot manages its own bearer: it POSTs
+  ADMIN_API_KEY            static x-api-key for the admin backend — the
+                           preferred auth. No login, no expiry, no refresh;
+                           when set the login/bearer machinery below is
+                           bypassed entirely and a 401/403 is final
+  SUGAR_ADMIN_API          legacy static bearer token; used as-is when no
+                           login credentials are set, and as a fallback
+                           when login fails
+  ADMIN_EMAIL              legacy admin-panel login credentials, used only
+  ADMIN_PASSWORD           when ADMIN_API_KEY is unset. When both are set
+                           the bot manages its own bearer: it POSTs
                            {email, password} to /auth/login, caches the
                            returned token until shortly before expiresAt,
-                           and re-logins once on a 401. Unset both AND
-                           SUGAR_ADMIN_API -> admin path unavailable
-                           (anonymous filing only)
+                           and re-logins once on a 401/403. Unset all of
+                           these -> admin path unavailable (anonymous
+                           filing only)
   ADMIN_LOGIN_URL          override the login endpoint (default: derived
                            from SUPPORT_ADMIN_URL by swapping /support
                            for /auth/login)
@@ -116,6 +122,10 @@ _ADMIN_ENV_DEFAULTS = {
 # otherwise break the Authorization header, and requests' InvalidHeader error
 # embeds the offending value (the token) in its message.
 SUGAR_ADMIN_API = "".join(os.getenv("SUGAR_ADMIN_API", "").split())
+# Preferred admin auth: a static x-api-key issued by the help desk. No login,
+# no expiry, no refresh — when set it wins over the managed-login bearer, which
+# stays in the module for the environments still using it.
+ADMIN_API_KEY = "".join(os.getenv("ADMIN_API_KEY", "").split())
 # A set-but-empty override falls back to the env default (disable the admin
 # path by unsetting the token, not by blanking the URL); normalized once here
 # so every consumer gets a clean, slash-free base.
@@ -316,10 +326,25 @@ def _safe_err(e: Exception) -> str:
     """Format an exception for logs/details with admin secrets masked —
     some requests exceptions (e.g. InvalidHeader) embed the header value."""
     s = f"{type(e).__name__}: {e}"
-    for secret in (SUGAR_ADMIN_API, _token_state["token"], ADMIN_PASSWORD):
+    for secret in (ADMIN_API_KEY, SUGAR_ADMIN_API, _token_state["token"], ADMIN_PASSWORD):
         if secret:
             s = s.replace(secret, "***")
     return s
+
+
+def _body_snippet(resp, limit: int = 300) -> str:
+    """First `limit` chars of a response body, whitespace-collapsed and with
+    secrets masked — enough to tell an HTML WAF block from a JSON API error."""
+    try:
+        text = " ".join((resp.text or "").split())
+    except Exception:
+        return "<unreadable>"
+    if not text:
+        return "<empty>"
+    for secret in (ADMIN_API_KEY, SUGAR_ADMIN_API, _token_state["token"], ADMIN_PASSWORD):
+        if secret:
+            text = text.replace(secret, "***")
+    return text[:limit] + ("…" if len(text) > limit else "")
 
 
 def _send_ticket_request(
@@ -349,7 +374,11 @@ def _send_ticket_request(
         return _result(False, detail=_safe_err(e))
 
     if not resp.ok:
-        print(f"[contact] {kind} HTTP {resp.status_code}", file=sys.stderr)
+        print(
+            f"[contact] {kind} HTTP {resp.status_code} — POST {url} "
+            f"body={_body_snippet(resp)}",
+            file=sys.stderr,
+        )
         return _result(False, http_status=resp.status_code, detail=resp.reason)
 
     ticket_id, status, raw = _extract_ticket_fields(resp)
@@ -447,21 +476,31 @@ def _admin_login() -> str:
     _LOGIN_COOLDOWN_S and leaves the static-token / anonymous fallbacks to do
     their job.
     """
+    url = _admin_login_url()
+
     def _failed(msg: str) -> str:
-        print(f"[contact] admin login {msg}", file=sys.stderr)
+        # Endpoint + email + response body, so a WAF/IP block (HTML, Cloudflare
+        # Ray ID) is distinguishable from a credential rejection without a
+        # redeploy. The password is NEVER logged: Cloud Logging is readable by
+        # anyone with viewer access, and a leaked credential means rotation.
+        print(
+            f"[contact] admin login {msg} — POST {url} "
+            f'{{"email": "{ADMIN_EMAIL}", "password": "***"}}',
+            file=sys.stderr,
+        )
         _token_state["failed_until"] = time.time() + _LOGIN_COOLDOWN_S
         return ""
 
     try:
         resp = requests.post(
-            _admin_login_url(),
+            url,
             json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
             timeout=SUPPORT_ADMIN_TIMEOUT,
         )
     except requests.RequestException as e:
         return _failed(f"failed: {_safe_err(e)}")
     if not resp.ok:
-        return _failed(f"HTTP {resp.status_code}")
+        return _failed(f"HTTP {resp.status_code} body={_body_snippet(resp)}")
     try:
         body = resp.json()
     except ValueError:
@@ -565,16 +604,28 @@ def _admin_token(stale_token: str = "") -> str:
 
 
 def _admin_post(url: str, *, json_body: dict, timeout: float):
-    """POST to the admin API with the managed bearer; one re-login retry on
-    401/403 (token revoked/expired server-side despite a fresh-looking cache —
-    prod adm-backend answers bad tokens with 403, not 401). A genuine
-    permission 403 just costs the one extra login+retry before falling back.
+    """POST to the admin API.
+
+    With ADMIN_API_KEY set the request carries a static `x-api-key` header:
+    nothing to expire, so a 401/403 is final (a retry would repeat it) and
+    the login/token machinery below is bypassed entirely.
+
+    Otherwise the managed bearer is used, with one re-login retry on 401/403
+    (token revoked/expired server-side despite a fresh-looking cache — prod
+    adm-backend answers bad tokens with 403, not 401).
 
     Raises requests.RequestException like a plain post — callers already
     handle that, including the fail-fast when no bearer could be obtained
     at all (login down, no static token): posting "Bearer " would only add
     a guaranteed-401 round trip on the chat hot path.
     """
+    if ADMIN_API_KEY:
+        return requests.post(
+            url,
+            json=json_body,
+            headers={"x-api-key": ADMIN_API_KEY},
+            timeout=timeout,
+        )
     token = _admin_token()
     if not token:
         raise requests.RequestException("no admin bearer available")
@@ -603,7 +654,7 @@ def admin_available() -> bool:
     Reads the module globals at call time so tests (and future hot config)
     can swap SUGAR_ADMIN_API / SUPPORT_ADMIN_URL / creds after import.
     """
-    return bool(SUPPORT_ADMIN_URL and (SUGAR_ADMIN_API or _login_available()))
+    return bool(SUPPORT_ADMIN_URL and (ADMIN_API_KEY or SUGAR_ADMIN_API or _login_available()))
 
 
 def _messages_result(ok: bool, *, total=None, messages: list | None = None, detail: str = "") -> dict:
@@ -634,7 +685,11 @@ def fetch_admin_ticket_messages(ticket_id: str, *, limit: int = 50, page: int = 
         return _messages_result(False, detail=_safe_err(e))
 
     if not resp.ok:
-        print(f"[contact] ticket messages HTTP {resp.status_code}", file=sys.stderr)
+        print(
+            f"[contact] ticket messages HTTP {resp.status_code} — POST {url} "
+            f"body={_body_snippet(resp)}",
+            file=sys.stderr,
+        )
         return _messages_result(False, detail=f"HTTP {resp.status_code}")
 
     try:
