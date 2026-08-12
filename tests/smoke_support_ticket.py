@@ -393,6 +393,39 @@ assert [c["headers"]["Authorization"] for c in _calls] == [
 ], _calls
 
 
+# a 403 mid-flight — some backends (and Cloudflare) answer a bad/irrelevant
+# token with 403 rather than 401 (seen on prod adm-backend); same treatment:
+# one re-login + one retry
+def _403_then_ok_post(url, files=None, json=None, headers=None, timeout=None):
+    if url.endswith("/auth/login"):
+        _login_calls.append(json)
+        return _FakeResp(
+            status_code=200,
+            reason="OK",
+            body={"token": "fresh-token-3", "expiresAt": _now_ms + 3_600_000},
+        )
+    _calls.append(
+        {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+    )
+    if headers == {"Authorization": "Bearer fresh-token-3"}:
+        return _FakeResp(body={"id": "ADM-22", "status": "None"})
+    return _FakeResp(status_code=403, reason="Forbidden")
+
+
+contact.requests.post = _403_then_ok_post
+_calls.clear()
+_login_calls.clear()
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="w", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and res["ticket_id"] == "ADM-22", res
+assert len(_login_calls) == 1, _login_calls
+assert [c["headers"]["Authorization"] for c in _calls] == [
+    "Bearer fresh-token-2",
+    "Bearer fresh-token-3",
+], _calls
+
+
 # login endpoint down -> handled ok=False (server then falls back to unauth), no loop
 def _login_down_post(url, files=None, json=None, headers=None, timeout=None):
     if url.endswith("/auth/login"):
@@ -509,7 +542,7 @@ contact.ADMIN_PASSWORD = ""
 contact._token_state.update(token="", expires_at=0, failed_until=0)
 contact.SUGAR_ADMIN_API = "test-admin-token"
 contact.requests.post = _fake_post
-print("10b. managed login: lazy login+cache, expiry refresh, 401 retry, login-down fallback, thread fetch, masking")
+print("10b. managed login: lazy login+cache, expiry refresh, 401/403 retry, login-down fallback, thread fetch, masking")
 
 # 11) server routing: linked account -> admin path (on_account); anonymous -> unauth
 phone2 = "+972502223344"

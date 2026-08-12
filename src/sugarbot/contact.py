@@ -504,7 +504,9 @@ def _admin_token(stale_token: str = "") -> str:
 
 def _admin_post(url: str, *, json_body: dict, timeout: float):
     """POST to the admin API with the managed bearer; one re-login retry on
-    401 (token revoked/expired server-side despite a fresh-looking cache).
+    401/403 (token revoked/expired server-side despite a fresh-looking cache —
+    prod adm-backend answers bad tokens with 403, not 401). A genuine
+    permission 403 just costs the one extra login+retry before falling back.
 
     Raises requests.RequestException like a plain post — callers already
     handle that, including the fail-fast when no bearer could be obtained
@@ -520,7 +522,7 @@ def _admin_post(url: str, *, json_body: dict, timeout: float):
         headers={"Authorization": f"Bearer {token}"},
         timeout=timeout,
     )
-    if resp.status_code == 401 and _login_available():
+    if resp.status_code in (401, 403) and _login_available():
         fresh = _admin_token(stale_token=token)
         if fresh and fresh != token:
             resp = requests.post(
