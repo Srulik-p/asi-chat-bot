@@ -327,6 +327,7 @@ def _login_aware_post(url, files=None, json=None, headers=None, timeout=None):
 
 contact.requests.post = _login_aware_post
 contact._token_state.update(token="", expires_at=0, failed_until=0)
+db.save_admin_token("", 0)
 _calls.clear()
 _next_body = {"id": "ADM-20", "status": "None"}
 res = contact.submit_admin_ticket(
@@ -353,8 +354,9 @@ assert _calls[-1]["headers"] == {"Authorization": "Bearer fresh-token-1"}, _call
 
 # a thread whose 401'd token was already replaced by a competing thread must
 # reuse the cached replacement, not re-login; only a still-cached stale token
-# forces a fresh login
+# (with no newer peer token in the DB either — see 10c) forces a fresh login
 _login_calls.clear()
+db.save_admin_token("", 0)
 contact._token_state.update(token="fresh-token-9", expires_at=_now_ms + 3_600_000, failed_until=0)
 assert contact._admin_token(stale_token="old-token") == "fresh-token-9"
 assert _login_calls == [], "cache already moved past the stale token -> no re-login"
@@ -439,6 +441,7 @@ def _login_down_post(url, files=None, json=None, headers=None, timeout=None):
 
 contact.requests.post = _login_down_post
 contact._token_state.update(token="", expires_at=0, failed_until=0)
+db.save_admin_token("", 0)
 _calls.clear()
 _login_calls.clear()
 res = contact.submit_admin_ticket(
@@ -468,6 +471,7 @@ def _login_down_admin_ok_post(url, files=None, json=None, headers=None, timeout=
 contact.requests.post = _login_down_admin_ok_post
 contact.SUGAR_ADMIN_API = "static-fallback-token"
 contact._token_state.update(token="", expires_at=0, failed_until=0)
+db.save_admin_token("", 0)
 _calls.clear()
 _login_calls.clear()
 _next_body = {"id": "ADM-30", "status": "None"}
@@ -494,6 +498,7 @@ for _bad_body in (["Bad Gateway"], {"user": "x"}, {"token": ""}, {"token": 42}, 
 
     contact.requests.post = _login_junk_post
     contact._token_state.update(token="", expires_at=0, failed_until=0)
+    db.save_admin_token("", 0)
     _calls.clear()
     res = contact.submit_admin_ticket(
         reason="help_desk", text="t", user_id="site-uuid-1", source_phone="+972501234567"
@@ -513,6 +518,7 @@ def _login_raises_post(url, files=None, json=None, headers=None, timeout=None):
 
 contact.requests.post = _login_raises_post
 contact._token_state.update(token="", expires_at=0, failed_until=0)
+db.save_admin_token("", 0)
 _calls.clear()
 res = contact.submit_admin_ticket(
     reason="help_desk", text="s", user_id="site-uuid-1", source_phone="+972501234567"
@@ -523,6 +529,7 @@ assert _calls == [], _calls
 # the thread fetch uses the managed token too
 contact.requests.post = _login_aware_post
 contact._token_state.update(token="", expires_at=0, failed_until=0)
+db.save_admin_token("", 0)
 _calls.clear()
 _login_calls.clear()
 _next_body = {"data": [{"id": "m1", "text": "hi"}], "totalItems": 1}
@@ -536,10 +543,133 @@ contact._token_state["token"] = "tok-live"
 masked = contact._safe_err(Exception("boom tok-live pw-secret"))
 assert "tok-live" not in masked and "pw-secret" not in masked and "***" in masked, masked
 
+# 10c) DB-persisted token: a login's token is written through to the DB so a
+# restarted process (or a sibling Cloud Run instance) reuses it instead of
+# logging in again; 401/403 first checks the DB for a peer-refreshed token.
+
+# the thread-fetch login above must have persisted its token
+row = db.load_admin_token()
+assert row == {"token": "fresh-token-1", "expires_at": _now_ms + 3_600_000}, row
+
+# cold start (empty in-memory cache) + valid DB token -> used without a login
+contact.requests.post = _login_aware_post
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+db.save_admin_token("persisted-tok-1", _now_ms + 3_600_000)
+_calls.clear()
+_login_calls.clear()
+_next_body = {"id": "ADM-30", "status": "None"}
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="p", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and res["ticket_id"] == "ADM-30", res
+assert _login_calls == [], "valid persisted token must be used without a login"
+assert _calls[0]["headers"] == {"Authorization": "Bearer persisted-tok-1"}, _calls[0]["headers"]
+
+# cold start + EXPIRED DB token -> fresh login, and the new token is persisted
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+db.save_admin_token("persisted-tok-old", _now_ms - 1)
+_calls.clear()
+_login_calls.clear()
+_next_body = {"id": "ADM-31", "status": "None"}
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="q", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and res["ticket_id"] == "ADM-31", res
+assert len(_login_calls) == 1, _login_calls
+assert _calls[0]["headers"] == {"Authorization": "Bearer fresh-token-1"}, _calls[0]["headers"]
+assert db.load_admin_token()["token"] == "fresh-token-1", "fresh login must be persisted"
+
+
+# our token is refused (403) while another instance already persisted a newer
+# one -> adopt the peer token from the DB, no login round trip
+def _403_then_peer_ok_post(url, files=None, json=None, headers=None, timeout=None):
+    if url.endswith("/auth/login"):
+        _login_calls.append(json)
+        return _FakeResp(
+            status_code=200,
+            reason="OK",
+            body={"token": "fresh-token-4", "expiresAt": _now_ms + 3_600_000},
+        )
+    _calls.append(
+        {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
+    )
+    if headers == {"Authorization": "Bearer tok-instance-b"}:
+        return _FakeResp(body={"id": "ADM-32", "status": "None"})
+    return _FakeResp(status_code=403, reason="Forbidden")
+
+
+contact.requests.post = _403_then_peer_ok_post
+contact._token_state.update(token="tok-instance-a", expires_at=_now_ms + 3_600_000, failed_until=0)
+db.save_admin_token("tok-instance-b", _now_ms + 3_600_000)
+_calls.clear()
+_login_calls.clear()
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="r", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and res["ticket_id"] == "ADM-32", res
+assert _login_calls == [], "peer-refreshed DB token must be adopted without a login"
+assert [c["headers"]["Authorization"] for c in _calls] == [
+    "Bearer tok-instance-a",
+    "Bearer tok-instance-b",
+], _calls
+
+# expiry rollover adopts a fresh peer token too (not only on 401/403), so
+# sibling instances don't all stampede the login endpoint at the same moment
+contact.requests.post = _login_aware_post
+contact._token_state.update(token="tok-expired", expires_at=_now_ms - 1, failed_until=0)
+db.save_admin_token("tok-peer", _now_ms + 3_600_000)
+_calls.clear()
+_login_calls.clear()
+_next_body = {"id": "ADM-34", "status": "None"}
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="t", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and res["ticket_id"] == "ADM-34", res
+assert _login_calls == [], "expired cache + fresh peer token in DB must not log in"
+assert _calls[0]["headers"] == {"Authorization": "Bearer tok-peer"}, _calls[0]["headers"]
+
+# login cooldown also shields the DB probe: with nothing cached and a recent
+# login failure, _admin_token must not do DB I/O under the lock on every call
+contact._token_state.update(token="", expires_at=0, failed_until=_time.time() + 30)
+db.save_admin_token("", 0)
+_load_probes = []
+_saved_load = db.load_admin_token
+db.load_admin_token = lambda: _load_probes.append(1)
+assert contact._admin_token() == contact.SUGAR_ADMIN_API
+assert _load_probes == [], "cooldown must short-circuit before the DB probe"
+db.load_admin_token = _saved_load
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+
+# DB down -> persistence is best-effort: managed login still works
+contact.requests.post = _login_aware_post
+contact._token_state.update(token="", expires_at=0, failed_until=0)
+db.save_admin_token("", 0)
+
+
+def _db_down(*a, **k):
+    raise RuntimeError("db down")
+
+
+_saved_load, _saved_save = db.load_admin_token, db.save_admin_token
+db.load_admin_token = _db_down
+db.save_admin_token = _db_down
+_calls.clear()
+_login_calls.clear()
+_next_body = {"id": "ADM-33", "status": "None"}
+res = contact.submit_admin_ticket(
+    reason="help_desk", text="s", user_id="site-uuid-1", source_phone="+972501234567"
+)
+assert res["ok"] is True and res["ticket_id"] == "ADM-33", res
+assert len(_login_calls) == 1, _login_calls
+db.load_admin_token, db.save_admin_token = _saved_load, _saved_save
+db.save_admin_token("", 0)
+print("10c. persisted admin token: cold-start reuse, expired -> relogin, peer-refresh adoption, db-down resilience")
+
 # restore the static-token setup the sections below expect
 contact.ADMIN_EMAIL = ""
 contact.ADMIN_PASSWORD = ""
 contact._token_state.update(token="", expires_at=0, failed_until=0)
+db.save_admin_token("", 0)
 contact.SUGAR_ADMIN_API = "test-admin-token"
 contact.requests.post = _fake_post
 print("10b. managed login: lazy login+cache, expiry refresh, 401/403 retry, login-down fallback, thread fetch, masking")

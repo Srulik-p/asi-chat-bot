@@ -133,6 +133,14 @@ conversation_state_table = Table(
 # {"on_account": bool, "response": <full body>} recording which path filed the
 # ticket, kept whole because the backend's exact response shape is not
 # documented. Nothing parses `raw` programmatically — it is for ops inspection.
+app_state_table = Table(
+    "app_state",
+    _metadata,
+    Column("key", String, primary_key=True),
+    Column("value", JSON),
+    Column("updated_at", DateTime, nullable=False),
+)
+
 support_tickets_table = Table(
     "support_tickets",
     _metadata,
@@ -494,3 +502,39 @@ def recent_support_tickets(
         }
         for r in rows
     ]
+
+
+def _set_app_state(key: str, value) -> None:
+    insert = pg_insert if _IS_POSTGRES else sqlite_insert
+    now = datetime.now(timezone.utc)
+    stmt = insert(app_state_table).values(key=key, value=value, updated_at=now)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[app_state_table.c.key],
+        set_={"value": value, "updated_at": now},
+    )
+    with _engine.begin() as conn:
+        conn.execute(stmt)
+
+
+def _get_app_state(key: str):
+    with _engine.connect() as conn:
+        row = conn.execute(
+            select(app_state_table.c.value).where(app_state_table.c.key == key)
+        ).first()
+    return row[0] if row else None
+
+
+def save_admin_token(token: str, expires_at) -> None:
+    """Persist the managed admin bearer (see contact.py) so restarts and
+    sibling Cloud Run instances reuse one login. An empty token clears it.
+
+    The token is a live credential: anyone with DB access can read it, same
+    as the customer PII already stored here."""
+    _set_app_state("admin_token", {"token": token, "expires_at": expires_at})
+
+
+def load_admin_token() -> Optional[dict]:
+    """The persisted admin bearer as {"token": str, "expires_at": epoch-ms},
+    or None if never saved."""
+    value = _get_app_state("admin_token")
+    return value if isinstance(value, dict) else None

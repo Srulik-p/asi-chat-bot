@@ -143,7 +143,10 @@ if ADMIN_EMAIL and ADMIN_PASSWORD and not ADMIN_LOGIN_URL and not SUPPORT_ADMIN_
         file=sys.stderr,
     )
 
-# Managed token cache: expires_at is the login response's epoch-ms expiresAt
+# Managed token cache — in-memory per process, write-through persisted to the
+# DB (db.save_admin_token) so restarts and sibling Cloud Run instances adopt
+# one login instead of each logging in. expires_at is the login response's
+# epoch-ms expiresAt
 # (0 = unknown -> trust the token until a 401 forces a refresh); failed_until
 # negative-caches a failed login (epoch seconds) so a login outage costs one
 # attempt per cooldown window instead of two per chat turn. The lock keeps
@@ -470,7 +473,35 @@ def _admin_login() -> str:
     _token_state["token"] = token
     _token_state["expires_at"] = expires if isinstance(expires, (int, float)) else 0
     _token_state["failed_until"] = 0.0
+    _persist_token(token, _token_state["expires_at"])
     return token
+
+
+def _load_persisted_token() -> dict | None:
+    """Best-effort read of the DB-persisted admin token; None on any failure
+    or if nothing (non-empty) was ever saved. Imported lazily so contact.py
+    stays importable without a configured database."""
+    try:
+        from . import db
+
+        row = db.load_admin_token()
+    except Exception as e:
+        print(f"[contact] admin token load failed: {type(e).__name__}", file=sys.stderr)
+        return None
+    if isinstance(row, dict) and isinstance(row.get("token"), str) and row["token"]:
+        return row
+    return None
+
+
+def _persist_token(token: str, expires_at) -> None:
+    """Best-effort write-through of a freshly logged-in token; the in-memory
+    cache stays authoritative, so a DB hiccup only costs sharing."""
+    try:
+        from . import db
+
+        db.save_admin_token(token, expires_at)
+    except Exception as e:
+        print(f"[contact] admin token save failed: {type(e).__name__}", file=sys.stderr)
 
 
 def _admin_token(stale_token: str = "") -> str:
@@ -490,6 +521,21 @@ def _admin_token(stale_token: str = "") -> str:
     if not _login_available():
         return SUGAR_ADMIN_API
     with _token_lock:
+        if not _token_state["token"] and time.time() < _token_state["failed_until"]:
+            # Nothing cached and a login just failed: skip the DB probes too,
+            # so a login outage doesn't turn every chat turn into DB I/O held
+            # under the global lock.
+            return SUGAR_ADMIN_API
+        if not _token_state["token"]:
+            # Cold start: adopt the token a previous process (or a sibling
+            # Cloud Run instance) persisted, instead of logging in again.
+            row = _load_persisted_token()
+            if row:
+                expires = row.get("expires_at")
+                _token_state["token"] = row["token"]
+                _token_state["expires_at"] = (
+                    expires if isinstance(expires, (int, float)) else 0
+                )
         token = _token_state["token"]
         expires_at = _token_state["expires_at"]
         fresh = token and (
@@ -497,6 +543,22 @@ def _admin_token(stale_token: str = "") -> str:
         )
         if fresh and token != stale_token:
             return token
+        # About to pay for a login (our token expired, or was just refused
+        # with 401/403). First adopt a fresh peer token from the DB: a
+        # sibling instance may have refreshed already, and logging in
+        # ourselves could invalidate its token. Accepted residual races:
+        # concurrent logins at rollover persist last-writer-wins (the older
+        # token can win the row), and an adopted peer token may itself be
+        # dead — it burns _admin_post's single retry and heals on the next
+        # call. Both need multi-instance timing and cost one request.
+        row = _load_persisted_token()
+        if row and row["token"] not in (token, stale_token):
+            expires = row.get("expires_at")
+            expires = expires if isinstance(expires, (int, float)) else 0
+            if not expires or time.time() * 1000 < expires - _TOKEN_SLACK_MS:
+                _token_state["token"] = row["token"]
+                _token_state["expires_at"] = expires
+                return row["token"]
         if time.time() < _token_state["failed_until"]:
             return SUGAR_ADMIN_API
         return _admin_login() or SUGAR_ADMIN_API
