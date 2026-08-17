@@ -43,12 +43,13 @@ from sugarbot import contact  # noqa: E402
 
 
 class _FakeResp:
-    def __init__(self, status_code=201, reason="Created", body=None, text=""):
+    def __init__(self, status_code=201, reason="Created", body=None, text="", headers=None):
         self.status_code = status_code
         self.reason = reason
         self.ok = 200 <= status_code < 300
         self._body = body
         self.text = text
+        self.headers = headers or {}
 
     def json(self):
         if self._body is None:
@@ -220,16 +221,15 @@ print("8. server.TOOLS_ALL registers submit_support_ticket; phone not a model ar
 
 # 9) admin path: env defaults + availability guard (no token/url -> handled failure)
 assert (
-    contact._ADMIN_ENV_DEFAULTS["qa"]["url"] == "https://backend-admin.sugarinter.media/api/support"
+    contact._ADMIN_ENV_DEFAULTS["qa"]["url"] == "https://backend-admin.sugarinter.media/support"
 ), contact._ADMIN_ENV_DEFAULTS
 assert (
-    contact._ADMIN_ENV_DEFAULTS["prod"]["url"] == "https://adm-backend.sugarinter.media/api/support"
+    contact._ADMIN_ENV_DEFAULTS["prod"]["url"] == "https://adm-backend.sugarinter.media/support"
 ), contact._ADMIN_ENV_DEFAULTS
-# the whole admin API lives under /api, so the derived login URL must too
 _saved_default_url = contact.SUPPORT_ADMIN_URL
 contact.SUPPORT_ADMIN_URL = contact._ADMIN_ENV_DEFAULTS["prod"]["url"]
 assert (
-    contact._admin_login_url() == "https://adm-backend.sugarinter.media/api/auth/login"
+    contact._admin_login_url() == "https://adm-backend.sugarinter.media/auth/login"
 ), contact._admin_login_url()
 contact.SUPPORT_ADMIN_URL = _saved_default_url
 assert contact.SUGAR_ADMIN_API == "" and not contact.admin_available()
@@ -687,7 +687,8 @@ def _login_403_post(url, files=None, json=None, headers=None, timeout=None):
         return _FakeResp(
             status_code=403,
             reason="Forbidden",
-            text="<html>error 1020  Cloudflare\nRay ID: abc pw-secret</html>",
+            # a real API rejection: JSON, so the body itself is the diagnosis
+            text='{"errorCode":"AuthTokenError","message":"[AuthGuard]\n bad pw-secret"}',
         )
     _calls.append(
         {"url": url, "files": files, "json": json, "headers": headers, "timeout": timeout}
@@ -706,7 +707,7 @@ _logged = _err.getvalue()
 assert "pw-secret" not in _logged, f"password must never be logged: {_logged}"
 assert "https://admin.example/auth/login" in _logged, _logged
 assert "admin@example.com" in _logged, _logged
-assert "403" in _logged and "Cloudflare" in _logged, _logged
+assert "403" in _logged and "AuthGuard" in _logged, _logged
 assert "\n" not in _logged.strip(), "one log line per failure (body is collapsed)"
 
 # a network-level login failure names the endpoint too
@@ -784,6 +785,62 @@ contact.ADMIN_EMAIL, contact.ADMIN_PASSWORD = _saved_email, _saved_pw
 assert "key-abc-123" not in contact._safe_err(Exception("boom key-abc-123")), "masked"
 contact.ADMIN_API_KEY = ""
 print("10e. ADMIN_API_KEY: x-api-key header, no login, no retry, masked in logs")
+
+# 10f) every admin call logs itself BEFORE sending — endpoint, full payload and
+# a key fingerprint — so a prod failure can be diagnosed from the logs alone.
+# The key is fingerprinted, never printed whole: Cloud Logging is readable by
+# anyone with viewer access, and a leaked key means rotation.
+contact.ADMIN_API_KEY = "sk-admin-abcdef1234567890-xyz"
+contact.requests.post = _login_aware_post
+_calls.clear()
+_next_body = {"id": "ADM-50", "status": "None"}
+_err = _io.StringIO()
+with _redirect_stderr(_err):
+    res = contact.submit_admin_ticket(
+        reason="help_desk",
+        text="חויבתי פעמיים",
+        user_id="site-uuid-7",
+        source_phone="+972501234567",
+    )
+_logged = _err.getvalue()
+assert res["ok"] is True, res
+assert contact.ADMIN_API_KEY not in _logged, f"whole key must never be logged: {_logged}"
+assert "sk-adm" in _logged and "len=" in _logged, f"key fingerprint expected: {_logged}"
+assert "https://admin.example/support" in _logged, _logged
+assert '"userId": "site-uuid-7"' in _logged, _logged
+assert "ForCustomerService" in _logged and "חויבתי פעמיים" in _logged, _logged
+
+# a Cloudflare block is named as such: the error code and Ray ID are pulled out
+# of the boilerplate HTML, and the edge is identified by its headers
+_CF_HTML = (
+    '<!DOCTYPE html><!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US">'
+    " <![endif]--><head><title>Access denied</title></head><body>"
+    '<span class="cf-error-code">1020</span> error code: 1020</body></html>'
+)
+
+
+def _cf_blocked_post(url, files=None, json=None, headers=None, timeout=None):
+    _calls.append({"url": url, "headers": headers})
+    return _FakeResp(
+        status_code=403,
+        reason="Forbidden",
+        text=_CF_HTML,
+        headers={"server": "cloudflare", "cf-ray": "9a1b2c3d4e5f-TLV"},
+    )
+
+
+contact.requests.post = _cf_blocked_post
+_err = _io.StringIO()
+with _redirect_stderr(_err):
+    res = contact.submit_admin_ticket(
+        reason="help_desk", text="x", user_id="site-uuid-7", source_phone="+972501234567"
+    )
+_logged = _err.getvalue()
+assert res["ok"] is False and res["http_status"] == 403, res
+assert "1020" in _logged, f"Cloudflare error code must be surfaced: {_logged}"
+assert "cloudflare" in _logged and "9a1b2c3d4e5f-TLV" in _logged, _logged
+contact.ADMIN_API_KEY = ""
+print("10f. admin calls log endpoint+payload+key fingerprint pre-send; CF blocks name code+ray")
 
 # restore the static-token setup the sections below expect
 contact.ADMIN_EMAIL = ""

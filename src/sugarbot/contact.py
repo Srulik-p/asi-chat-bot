@@ -73,7 +73,9 @@ The authoritative list is GET <backend>/user/option/all -> ContactUsReason
 
 from __future__ import annotations
 
+import json as _json
 import os
+import re
 import sys
 import threading
 import time
@@ -113,12 +115,12 @@ SUPPORT_TICKET_TIMEOUT = float(os.getenv("SUPPORT_TICKET_TIMEOUT", "10"))
 
 # Admin help-desk API — files a ticket ON a signed-in user's account. Like the
 # unauth endpoints above, QA and prod are separate backends; the /auth/login
-# endpoint is derived from these by _admin_login_url (…/support -> /auth/login),
-# so it lands under /api too. These /api routes are reachable only from
-# whitelisted (GCP) egress — they cannot be exercised from a dev machine.
+# endpoint is derived from these by _admin_login_url (…/support -> /auth/login).
+# The path is /support, NOT /api/support (tried 2026-08-17; /api answers an
+# empty 401 while /support reaches the app).
 _ADMIN_ENV_DEFAULTS = {
-    "qa": {"url": "https://backend-admin.sugarinter.media/api/support"},
-    "prod": {"url": "https://adm-backend.sugarinter.media/api/support"},
+    "qa": {"url": "https://backend-admin.sugarinter.media/support"},
+    "prod": {"url": "https://adm-backend.sugarinter.media/support"},
 }
 # Whitespace-collapsed, not just stripped: a line-wrapped copy-paste would
 # otherwise break the Authorization header, and requests' InvalidHeader error
@@ -334,6 +336,65 @@ def _safe_err(e: Exception) -> str:
     return s
 
 
+def _log_admin_call(url: str, json_body: dict | None, *, auth: str) -> None:
+    """Log an outbound admin request before it goes out: endpoint, auth
+    fingerprint and payload. Admin calls are low-volume (only on-account
+    tickets and thread fetches) and this is the only record of what we
+    actually sent when the help desk rejects it."""
+    try:
+        payload = _json.dumps(json_body or {}, ensure_ascii=False)
+    except (TypeError, ValueError):
+        payload = repr(json_body)
+    if len(payload) > 700:
+        payload = payload[:700] + "…"
+    print(f"[contact] admin POST {url} {auth} payload={payload}", file=sys.stderr)
+
+
+def _key_fingerprint(key: str) -> str:
+    """Enough of a credential to confirm WHICH one was sent, never enough to
+    reuse it. Short keys are reduced to their length only."""
+    if not key:
+        return "<none>"
+    if len(key) < 16:
+        return f"<set, len={len(key)}>"
+    return f"{key[:6]}…{key[-4:]} (len={len(key)})"
+
+
+def _resp_diag(resp) -> str:
+    """One-line diagnosis of a failed admin response.
+
+    Names the edge that answered (Cloudflare blocks return boilerplate HTML
+    whose first 300 chars are identical for every cause, so the error code and
+    Ray ID are pulled out instead) and falls back to a masked body prefix for
+    real API errors."""
+    try:
+        headers = getattr(resp, "headers", {}) or {}
+        server = headers.get("server") or ""
+        ray = headers.get("cf-ray") or ""
+        text = " ".join((getattr(resp, "text", "") or "").split())
+    except Exception:
+        return "<unreadable>"
+    for secret in (ADMIN_API_KEY, SUGAR_ADMIN_API, _token_state["token"], ADMIN_PASSWORD):
+        if secret:
+            text = text.replace(secret, "***")
+    parts = []
+    if server:
+        parts.append(f"server={server}")
+    if ray:
+        parts.append(f"cf-ray={ray}")
+    # Cloudflare states the reason as a 4-digit code (1020 = firewall/IP rule,
+    # 1015 = rate limited, 1010 = bad TLS fingerprint) far past a naive prefix.
+    if "<!DOCTYPE html" in text or "<html" in text:
+        codes = re.findall(r"(?:error code:?\s*|cf-error-code[^>]*>)\s*(\d{4})", text, re.I)
+        parts.append(f"cf-error={codes[0]}" if codes else "html-error-page")
+        title = re.search(r"<title[^>]*>(.*?)</title>", text, re.I)
+        if title:
+            parts.append(f"title={title.group(1).strip()[:80]!r}")
+        return " ".join(parts) or "html-error-page"
+    parts.append(f"body={text[:300]}{'…' if len(text) > 300 else ''}" if text else "body=<empty>")
+    return " ".join(parts)
+
+
 def _body_snippet(resp, limit: int = 300) -> str:
     """First `limit` chars of a response body, whitespace-collapsed and with
     secrets masked — enough to tell an HTML WAF block from a JSON API error."""
@@ -378,7 +439,7 @@ def _send_ticket_request(
     if not resp.ok:
         print(
             f"[contact] {kind} HTTP {resp.status_code} — POST {url} "
-            f"body={_body_snippet(resp)}",
+            f"{_resp_diag(resp)}",
             file=sys.stderr,
         )
         return _result(False, http_status=resp.status_code, detail=resp.reason)
@@ -502,7 +563,7 @@ def _admin_login() -> str:
     except requests.RequestException as e:
         return _failed(f"failed: {_safe_err(e)}")
     if not resp.ok:
-        return _failed(f"HTTP {resp.status_code} body={_body_snippet(resp)}")
+        return _failed(f"HTTP {resp.status_code} {_resp_diag(resp)}")
     try:
         body = resp.json()
     except ValueError:
@@ -622,6 +683,7 @@ def _admin_post(url: str, *, json_body: dict, timeout: float):
     a guaranteed-401 round trip on the chat hot path.
     """
     if ADMIN_API_KEY:
+        _log_admin_call(url, json_body, auth=f"x-api-key={_key_fingerprint(ADMIN_API_KEY)}")
         return requests.post(
             url,
             json=json_body,
@@ -631,6 +693,7 @@ def _admin_post(url: str, *, json_body: dict, timeout: float):
     token = _admin_token()
     if not token:
         raise requests.RequestException("no admin bearer available")
+    _log_admin_call(url, json_body, auth=f"bearer={_key_fingerprint(token)}")
     resp = requests.post(
         url,
         json=json_body,
@@ -689,7 +752,7 @@ def fetch_admin_ticket_messages(ticket_id: str, *, limit: int = 50, page: int = 
     if not resp.ok:
         print(
             f"[contact] ticket messages HTTP {resp.status_code} — POST {url} "
-            f"body={_body_snippet(resp)}",
+            f"{_resp_diag(resp)}",
             file=sys.stderr,
         )
         return _messages_result(False, detail=f"HTTP {resp.status_code}")
