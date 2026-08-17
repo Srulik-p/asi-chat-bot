@@ -80,20 +80,13 @@ assert contact.SUPPORT_TICKET_ORIGIN == "https://qa.sugardaddy.co.il", contact.S
 assert (
     contact._ENV_DEFAULTS["qa"]["url"] != contact._ENV_DEFAULTS["prod"]["url"]
 ), "qa and prod must post to different backends"
-# QA must map every choosable reason; prod may lag on newly added reasons
-# (their prod optionIds get snapshotted at launch) — those degrade to help_desk
-# via resolve_reason, checked below.
+# Both envs must map every choosable reason — prod's ids were snapshotted from
+# the live reason table on 2026-08-17, so nothing silently degrades any more.
 missing_qa = set(contact.REASON_CHOICES) - set(contact.REASON_IDS_BY_ENV["qa"])
 assert not missing_qa, f"qa map missing reasons: {missing_qa}"
-_ORIGINAL_REASONS = {
-    "login_email", "help_desk", "forgot_password", "technical",
-    "remove_account", "report", "other",
-}
-missing_prod = _ORIGINAL_REASONS - set(contact.REASON_IDS_BY_ENV["prod"])
-assert not missing_prod, f"prod map missing original reasons: {missing_prod}"
+missing_prod = set(contact.REASON_CHOICES) - set(contact.REASON_IDS_BY_ENV["prod"])
+assert not missing_prod, f"prod map missing reasons: {missing_prod}"
 for key in contact.REASON_CHOICES:
-    if key not in contact.REASON_IDS_BY_ENV["prod"]:
-        continue  # unmapped in prod -> covered by the help_desk fallback check
     assert (
         contact.REASON_IDS_BY_ENV["qa"][key] != contact.REASON_IDS_BY_ENV["prod"][key]
     ), f"qa/prod optionId for {key} must differ (separate databases)"
@@ -109,9 +102,13 @@ assert contact.resolve_reason(raw) == raw, "raw optionId should pass through"
 assert contact.resolve_reason("not-a-reason") is None
 assert contact.resolve_reason("") is None
 # A choosable reason with no optionId in the active env degrades to help_desk
-# (prod until its new-reason ids are snapshotted); junk still resolves to None.
+# (the safety net for a reason added to the tool before its backend id exists);
+# junk still resolves to None. Both maps are complete today, so the incomplete
+# map is built here rather than relying on prod lagging.
 _saved_ids = contact.REASON_IDS
-contact.REASON_IDS = contact.REASON_IDS_BY_ENV["prod"]
+contact.REASON_IDS = {
+    k: v for k, v in contact.REASON_IDS_BY_ENV["prod"].items() if k != "stop_payment"
+}
 assert (
     contact.resolve_reason("stop_payment") == contact.REASON_IDS_BY_ENV["prod"]["help_desk"]
 ), "unmapped choosable reason must degrade to help_desk"
@@ -268,7 +265,7 @@ assert call["json"] == {
     "sources": ["WhatsApp"],
     "reason": "8ddc112a-e53a-4236-a9be-7f7f1db729ba",
     "text": "לא מצליח להעלות תמונה",
-    "status": "ForCustomerService",
+    "status": "Opened",
     "sourcePhoneNumber": "+972501234567",
     "sourceNickname": "",
     "sourceEmail": "",
@@ -808,7 +805,7 @@ assert contact.ADMIN_API_KEY not in _logged, f"whole key must never be logged: {
 assert "sk-adm" in _logged and "len=" in _logged, f"key fingerprint expected: {_logged}"
 assert "https://admin.example/support" in _logged, _logged
 assert '"userId": "site-uuid-7"' in _logged, _logged
-assert "ForCustomerService" in _logged and "חויבתי פעמיים" in _logged, _logged
+assert "Opened" in _logged and "חויבתי פעמיים" in _logged, _logged
 
 # a Cloudflare block is named as such: the error code and Ray ID are pulled out
 # of the boilerplate HTML, and the edge is identified by its headers

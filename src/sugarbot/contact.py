@@ -191,9 +191,8 @@ REASON_IDS_BY_ENV = {
         "id_verification": "bfae8355-20ba-4141-8350-2eba146d6e3c",   # אימות תעודת זהות
         "photo_verification": "cc2c5598-c3a6-4664-b6d0-038e1369658b",  # אימות תמונה
     },
-    # stop_payment / id_verification / photo_verification: prod optionIds are
-    # unknown until launch (snapshot them from prod /user/option/all); until
-    # then resolve_reason degrades those keys to help_desk in prod.
+    # Snapshotted from the prod reason table on 2026-08-17 — complete, so no
+    # key degrades to help_desk any more.
     "prod": {
         "login_email": "4e2f8c6f-5a9b-4cf4-bf9f-b5b21d3bacbe",       # לא מצליח להתחבר עם המייל שלי
         "help_desk": "4174349b-a7d5-4986-8a57-8dd8399ac334",         # שיחה עם נציג שירות לקוחות
@@ -203,6 +202,9 @@ REASON_IDS_BY_ENV = {
         "other": "87f9f0c7-109f-4d76-9162-125b606bdf6a",             # אחר
         "report": "3e6ca411-22bb-4869-b367-4685b2c06bb6",            # דיווח
         "admin_declined": "e5e0d6b6-2108-4a93-93fb-125b4a7a6b97",    # admin declined
+        "stop_payment": "101bf466-cb4d-41e8-812f-b2cf2ba8a24d",      # הפסקת תשלום
+        "id_verification": "eea39259-aaf1-4523-b30a-87fdbc88f650",   # אימות תעודת זהות
+        "photo_verification": "a78dc46a-4a95-4bd7-9f68-77d5307fab9c",  # אימות תמונה
     },
 }
 
@@ -820,15 +822,15 @@ def submit_admin_ticket(
 
     # Mirrors the admin panel's manual-ticket payload. sourceNickname stays
     # empty on purpose: the backend resolves the account (and its current
-    # nickname) from userId, and our cached copy may be stale. status
-    # "ForCustomerService" opens the ticket straight in the customer-service
-    # queue (instead of the untriaged "None" state).
+    # nickname) from userId, and our cached copy may be stale. status "Opened"
+    # is the API's documented initial state (was "ForCustomerService" until
+    # 2026-08-17) — it must not be the untriaged literal "None".
     payload = {
         "userId": user_id,
         "sources": ["WhatsApp"],
         "reason": reason_id,
         "text": text or "",
-        "status": "ForCustomerService",
+        "status": "Opened",
         "sourcePhoneNumber": source_phone,
         "sourceNickname": "",
         "sourceEmail": source_email or "",
