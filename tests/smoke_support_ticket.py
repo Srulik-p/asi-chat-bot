@@ -220,11 +220,18 @@ print("8. server.TOOLS_ALL registers submit_support_ticket; phone not a model ar
 
 # 9) admin path: env defaults + availability guard (no token/url -> handled failure)
 assert (
-    contact._ADMIN_ENV_DEFAULTS["qa"]["url"] == "https://backend-admin.sugarinter.media/support"
+    contact._ADMIN_ENV_DEFAULTS["qa"]["url"] == "https://backend-admin.sugarinter.media/api/support"
 ), contact._ADMIN_ENV_DEFAULTS
 assert (
-    contact._ADMIN_ENV_DEFAULTS["prod"]["url"] == "https://adm-backend.sugarinter.media/support"
+    contact._ADMIN_ENV_DEFAULTS["prod"]["url"] == "https://adm-backend.sugarinter.media/api/support"
 ), contact._ADMIN_ENV_DEFAULTS
+# the whole admin API lives under /api, so the derived login URL must too
+_saved_default_url = contact.SUPPORT_ADMIN_URL
+contact.SUPPORT_ADMIN_URL = contact._ADMIN_ENV_DEFAULTS["prod"]["url"]
+assert (
+    contact._admin_login_url() == "https://adm-backend.sugarinter.media/api/auth/login"
+), contact._admin_login_url()
+contact.SUPPORT_ADMIN_URL = _saved_default_url
 assert contact.SUGAR_ADMIN_API == "" and not contact.admin_available()
 _calls.clear()
 res = contact.submit_admin_ticket(

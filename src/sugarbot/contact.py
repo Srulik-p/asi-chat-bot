@@ -113,10 +113,12 @@ SUPPORT_TICKET_TIMEOUT = float(os.getenv("SUPPORT_TICKET_TIMEOUT", "10"))
 
 # Admin help-desk API — files a ticket ON a signed-in user's account. Like the
 # unauth endpoints above, QA and prod are separate backends; the /auth/login
-# endpoint is derived from these by _admin_login_url (…/support -> /auth/login).
+# endpoint is derived from these by _admin_login_url (…/support -> /auth/login),
+# so it lands under /api too. These /api routes are reachable only from
+# whitelisted (GCP) egress — they cannot be exercised from a dev machine.
 _ADMIN_ENV_DEFAULTS = {
-    "qa": {"url": "https://backend-admin.sugarinter.media/support"},
-    "prod": {"url": "https://adm-backend.sugarinter.media/support"},
+    "qa": {"url": "https://backend-admin.sugarinter.media/api/support"},
+    "prod": {"url": "https://adm-backend.sugarinter.media/api/support"},
 }
 # Whitespace-collapsed, not just stripped: a line-wrapped copy-paste would
 # otherwise break the Authorization header, and requests' InvalidHeader error
