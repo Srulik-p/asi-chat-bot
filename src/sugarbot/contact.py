@@ -336,6 +336,31 @@ def _safe_err(e: Exception) -> str:
     return s
 
 
+_EGRESS_IP_URLS = ("https://api.ipify.org", "https://checkip.amazonaws.com")
+
+
+def log_egress_ip() -> str:
+    """Log the public IP this process egresses from, once per instance.
+
+    The admin help desk restricts access by source IP, and a Cloud Run service
+    only leaves through a NAT static address when it is attached to the VPC
+    with all-traffic egress — otherwise it uses a rotating Google pool. This
+    prints what the outside world actually sees, so the configured whitelist
+    can be checked against reality. Best-effort: bounded, never raises.
+    """
+    for url in _EGRESS_IP_URLS:
+        try:
+            resp = requests.get(url, timeout=3)
+            ip = (getattr(resp, "text", "") or "").strip()
+        except Exception:
+            continue
+        if ip:
+            print(f"[contact] egress IP (as seen by {url}): {ip}", file=sys.stderr)
+            return ip
+    print("[contact] egress IP unknown — all lookups failed", file=sys.stderr)
+    return ""
+
+
 def _log_admin_call(url: str, json_body: dict | None, *, auth: str) -> None:
     """Log an outbound admin request before it goes out: endpoint, auth
     fingerprint and payload. Admin calls are low-volume (only on-account

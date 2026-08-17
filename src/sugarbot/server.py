@@ -157,6 +157,10 @@ async def lifespan(_app: FastAPI):
         )
     anyio.to_thread.current_default_thread_limiter().total_tokens = SERVER_THREADPOOL_SIZE
     db.init_db()
+    # Which public IP we leave from — the admin help desk whitelists by source
+    # IP. In a daemon thread so a slow lookup can't eat into the startup
+    # deadline; the log line is the only consumer.
+    threading.Thread(target=contact.log_egress_ip, daemon=True).start()
     yield
 
 

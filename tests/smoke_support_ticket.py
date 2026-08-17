@@ -842,6 +842,44 @@ assert "cloudflare" in _logged and "9a1b2c3d4e5f-TLV" in _logged, _logged
 contact.ADMIN_API_KEY = ""
 print("10f. admin calls log endpoint+payload+key fingerprint pre-send; CF blocks name code+ray")
 
+# 10g) the service reports the public IP it egresses from, so a whitelisted
+# static NAT address can be checked against what the backend actually sees.
+# Best-effort: never raises, never blocks startup on a bad network.
+_get_calls: list = []
+
+
+class _FakeGet:
+    def __init__(self, text):
+        self.text = text
+        self.ok = True
+        self.status_code = 200
+
+
+def _fake_get(url, timeout=None):
+    _get_calls.append({"url": url, "timeout": timeout})
+    return _FakeGet(" 34.76.12.9\n")
+
+
+contact.requests.get = _fake_get
+_err = _io.StringIO()
+with _redirect_stderr(_err):
+    contact.log_egress_ip()
+_logged = _err.getvalue()
+assert "34.76.12.9" in _logged, f"egress IP must be logged: {_logged}"
+assert _get_calls and _get_calls[0]["timeout"], "must use a bounded timeout"
+
+
+def _get_boom(url, timeout=None):
+    raise contact.requests.ConnectionError("no network")
+
+
+contact.requests.get = _get_boom
+_err = _io.StringIO()
+with _redirect_stderr(_err):
+    contact.log_egress_ip()  # must not raise
+assert "egress" in _err.getvalue().lower(), _err.getvalue()
+print("10g. egress IP self-report: logged on success, silent-safe on failure")
+
 # restore the static-token setup the sections below expect
 contact.ADMIN_EMAIL = ""
 contact.ADMIN_PASSWORD = ""
