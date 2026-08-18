@@ -106,9 +106,12 @@ _ON_CLOUD_RUN = bool(os.getenv("K_SERVICE"))
 # QA login links (logging in on QA never fires the prod /auth/callback, which
 # dead-loops the whole identification flow).
 LOGIN_URL_BASE = os.getenv("LOGIN_URL_BASE", "https://qa.sugardaddy.co.il/sign-in")
-# How long cached login data stays valid. Past this we ask the user to log in
-# again so we never act on stale account status/labels.
-ACCOUNT_FRESHNESS_HOURS = int(os.getenv("ACCOUNT_FRESHNESS_HOURS", "72"))
+# How long cached login data counts as current. Past this get_account_status
+# still returns the cached snapshot (labels/premium) — the customer should not
+# have to log in again just to get an answer — but flags it stale so the bot
+# says the info is from their last login and may have changed, and offers a
+# login link to refresh.
+ACCOUNT_FRESHNESS_HOURS = int(os.getenv("ACCOUNT_FRESHNESS_HOURS", "48"))
 # Inactivity auto-close: warn after the conversation has been waiting on the
 # customer for INACTIVITY_WARN_HOURS, then close it INACTIVITY_CLOSE_HOURS after
 # the last activity if still no reply. Driven by /maintenance/sweep-idle.
@@ -393,13 +396,13 @@ ACCOUNT_TOOLS = [
         "function": {
             "name": "escalate_to_human",
             "description": (
-                "Record that you are handing this conversation to a human "
-                "representative. Call this WHENEVER you tell the customer you are "
-                "forwarding to the team / that a human will get back to them "
-                "(refunds, blocked appeals, double charges, serious reports, an "
-                "explicit request for a human, etc.) — in addition to your message "
-                "to the customer. It marks the inquiry as awaiting a rep so the "
-                "system does not auto-close it while a reply is still owed. Takes "
+                "Mark this conversation as awaiting a human representative so the "
+                "system does not auto-close it while a reply is still owed. A "
+                "successful submit_support_ticket ALREADY does this (its result "
+                "says escalated=true) — never call escalate_to_human after filing "
+                "a ticket, it only adds a wasted round. Use it only for a hand-off "
+                "with NO ticket (e.g. ticket filing failed and the matter is urgent, "
+                "or a flow that explicitly says to escalate without a ticket). Takes "
                 "no arguments — the conversation is identified automatically."
             ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -429,11 +432,11 @@ CONTACT_TOOLS = [
                 "stuck (no answer in the knowledge base / could not resolve) and the "
                 "customer accepted your offer to open a ticket. Use "
                 "reason='help_desk' for a plain 'I want to talk to a rep' request, "
-                "otherwise the closest category. Pair it with escalate_to_human "
-                "(which marks the conversation awaiting a rep) — but only when a "
-                "ticket is actually filed: on a login_required result nothing was "
-                "filed yet, so do not call escalate_to_human until the retry "
-                "(after login, or with no_account=true) succeeds. Do NOT use it for "
+                "otherwise the closest category. A successful submit also marks the "
+                "conversation as awaiting a rep by itself (result has "
+                "escalated=true) — do NOT call escalate_to_human afterwards. On a "
+                "login_required result nothing was filed (and nothing is escalated) "
+                "yet; retry after login, or with no_account=true. Do NOT use it for "
                 "questions you can answer yourself from the knowledge base, and for "
                 "irreversible actions (e.g. account removal) only after the customer "
                 "has explicitly confirmed. Provide `text` (a clear Hebrew summary of "
@@ -499,8 +502,8 @@ CONTACT_TOOLS = [
 TOOLS_ALL = TOOLS + ACCOUNT_TOOLS + CONTACT_TOOLS
 
 
-def _login_is_stale(user: dict) -> bool:
-    """True if the cached login is older than ACCOUNT_FRESHNESS_HOURS (or undatable)."""
+def _hours_since_login(user: dict) -> float | None:
+    """Hours since the cached login row was last refreshed; None if undatable."""
     raw = user.get("updated_at")
     if isinstance(raw, datetime):
         dt = raw
@@ -508,63 +511,85 @@ def _login_is_stale(user: dict) -> bool:
         try:
             dt = datetime.fromisoformat(raw)
         except ValueError:
-            return True
+            return None
     else:
-        return True
+        return None
     if dt.tzinfo is None:  # SQLite hands back naive datetimes; they are UTC.
         dt = dt.replace(tzinfo=timezone.utc)
-    age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
-    return age_hours > ACCOUNT_FRESHNESS_HOURS
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
 
 
-def _not_logged_in(phone: str, *, stale: bool) -> str:
+def _login_is_stale(user: dict) -> bool:
+    """True if the cached login is older than ACCOUNT_FRESHNESS_HOURS (or undatable)."""
+    age_hours = _hours_since_login(user)
+    return age_hours is None or age_hours > ACCOUNT_FRESHNESS_HOURS
+
+
+def _login_url_for(phone: str) -> str:
     # Known exception to "the phone never reaches the model": the site's sign-in
     # contract requires the phone as a query arg, so it appears inside login_url.
     # The system prompt forbids the model from quoting or reasoning about it.
-    login_url = f"{LOGIN_URL_BASE}?phoneNumber={quote(phone, safe='')}"
-    if stale:
-        instructions = (
-            f"המידע השמור על הלקוח ישן (עברו יותר מ-{ACCOUNT_FRESHNESS_HOURS} שעות "
-            "מההתחברות האחרונה). בקש/י ממנו להתחבר שוב כדי לרענן, ושלח/י לו את "
-            "הערך של השדה login_url (כתובת ה-URL המלאה) כקישור לחיץ. אל תכתוב/י "
-            "את המילה 'login_url' או סוגריים - רק את הכתובת עצמה."
-        )
-    else:
-        instructions = (
-            "הלקוח לא מחובר. בקש/י ממנו להתחבר כדי שתוכל/י לראות את הסטטוס שלו, "
-            "ושלח/י לו את הערך של השדה login_url (כתובת ה-URL המלאה) כקישור לחיץ. "
-            "אל תכתוב/י את המילה 'login_url' או סוגריים - רק את הכתובת עצמה."
-        )
+    return f"{LOGIN_URL_BASE}?phoneNumber={quote(phone, safe='')}"
+
+
+def _not_logged_in(phone: str) -> str:
+    instructions = (
+        "הלקוח לא מחובר. בקש/י ממנו להתחבר כדי שתוכל/י לראות את הסטטוס שלו, "
+        "ושלח/י לו את הערך של השדה login_url (כתובת ה-URL המלאה) כקישור לחיץ. "
+        "אל תכתוב/י את המילה 'login_url' או סוגריים - רק את הכתובת עצמה."
+    )
     return json.dumps(
-        {"logged_in": False, "stale": stale, "login_url": login_url, "instructions": instructions},
+        {"logged_in": False, "login_url": _login_url_for(phone), "instructions": instructions},
         ensure_ascii=False,
     )
+
+
+def _stale_note(age_hours: float | None) -> str:
+    """Hebrew 'this is from your last login N ago' phrase for the model."""
+    if age_hours is None:
+        return "מועד ההתחברות האחרונה לא ידוע"
+    days = int(age_hours // 24)
+    if days >= 2:
+        return f"ההתחברות האחרונה הייתה לפני כ-{days} ימים"
+    return f"ההתחברות האחרונה הייתה לפני כ-{int(age_hours)} שעות"
 
 
 def _account_status_for(phone: str) -> str:
     """Resolve get_account_status for `phone`. Returns a JSON string (tool result).
 
-    Login data is cached in the DB on /auth/callback. We serve it only while
-    fresh (< ACCOUNT_FRESHNESS_HOURS since last login); a missing or stale row
-    routes the bot back to the login step so we never act on stale labels.
+    Login data is cached in the DB on /auth/callback. A missing row routes the
+    bot to the login step. A row older than ACCOUNT_FRESHNESS_HOURS is still
+    served (the customer should get an answer, not a login wall) but flagged
+    `stale` with the age and a login_url, so the bot answers from it while
+    saying it reflects their last login and may have changed since.
     """
     user = db.get_user_by_phone(phone)
     if user is None:
-        return _not_logged_in(phone, stale=False)
+        return _not_logged_in(phone)
+    status: dict = {
+        "logged_in": True,
+        "nickname": user["nickname"],
+        "is_premium": user["is_premium"],
+        # May be None if the site hasn't sent it yet — bot falls back to
+        # gender-neutral phrasing when absent.
+        "gender": user.get("gender"),
+        "labels": user["labels"],
+    }
     if _login_is_stale(user):
-        return _not_logged_in(phone, stale=True)
-    return json.dumps(
-        {
-            "logged_in": True,
-            "nickname": user["nickname"],
-            "is_premium": user["is_premium"],
-            # May be None if the site hasn't sent it yet — bot falls back to
-            # gender-neutral phrasing when absent.
-            "gender": user.get("gender"),
-            "labels": user["labels"],
-        },
-        ensure_ascii=False,
-    )
+        age_hours = _hours_since_login(user)
+        status["stale"] = True
+        status["hours_since_login"] = int(age_hours) if age_hours is not None else None
+        status["login_url"] = _login_url_for(phone)
+        status["instructions"] = (
+            f"הנתונים האלה הם מההתחברות האחרונה של הלקוח ({_stale_note(age_hours)}, "
+            f"יותר מ-{ACCOUNT_FRESHNESS_HOURS} שעות) ולכן ייתכן שהמידע לא עדכני. "
+            "ענה/י על סמך הנתונים האלה, אבל ציין/י בקצרה שהם נכונים למועד ההתחברות "
+            "האחרונה ואולי השתנו מאז. אם הלקוח רוצה סטטוס עדכני, או שהתשובה תלויה "
+            "במצב הנוכחי המדויק - הצע/י לו להתחבר שוב ושלח/י את הערך של השדה "
+            "login_url (כתובת ה-URL המלאה) כקישור לחיץ. אל תכתוב/י את המילה "
+            "'login_url' או סוגריים - רק את הכתובת עצמה."
+        )
+    return json.dumps(status, ensure_ascii=False)
 
 
 try:
@@ -754,7 +779,7 @@ def _submit_ticket_for(phone: str, args: dict) -> str:
     """Handle the submit_support_ticket tool call. Returns the JSON tool result.
 
     Routing: a conversation linked to a site account (users.external_id exists —
-    any age; the 72h freshness window only gates get_account_status) files the
+    any age; ACCOUNT_FRESHNESS_HOURS only flags get_account_status) files the
     ticket ON the account via the admin API. An unlinked conversation gets a
     login gate first: the tool files nothing and returns login_required with a
     login_url, so the customer can log in and the ticket lands on their account
@@ -789,9 +814,7 @@ def _submit_ticket_for(phone: str, args: dict) -> str:
         )
 
     if external_id is None and not no_account and not lookup_failed:
-        # Same phone-in-URL exception as _not_logged_in: the sign-in contract
-        # needs it, and the prompt forbids the model from quoting it.
-        login_url = f"{LOGIN_URL_BASE}?phoneNumber={quote(phone, safe='')}"
+        login_url = _login_url_for(phone)
         instructions = (
             "הפנייה עוד לא נפתחה. הלקוח לא מחובר לחשבון אתר, ופנייה שנפתחת על "
             "החשבון מזהה אותו לצוות אוטומטית. בקש/י ממנו להתחבר קודם, ושלח/י לו "
@@ -948,12 +971,12 @@ def _run_chat_locked(
     # Build the LLM-facing messages list. scrub_messages redacts emails/phones/IDs
     # from user-role content only; the stored DB rows keep the raw values for
     # human-rep visibility.
-    history = db.load_history(phone)
-    # Replay only the most recent window to the model (full log stays in the DB).
-    # A slice can cut an assistant tool_calls turn off from its tool results;
-    # repair_tool_calls below drops the dangling half cleanly.
-    if len(history) > HISTORY_MAX_MESSAGES:
-        history = history[-HISTORY_MAX_MESSAGES:]
+    # Replay only the most recent window to the model (full log stays in the
+    # DB, and is only fetched that far — a months-old thread must not be
+    # shipped over the wire every turn). A slice can cut an assistant
+    # tool_calls turn off from its tool results; repair_tool_calls below drops
+    # the dangling half cleanly.
+    history = db.load_history(phone, limit=HISTORY_MAX_MESSAGES)
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
     messages = scrub_messages(messages)
     # Attach this turn's media to the last (current) user message as multimodal
@@ -992,8 +1015,11 @@ def _run_chat_locked(
     ticket_gated = False
     ticket_filed = False
 
+    turn_t0 = time.monotonic()
+    rounds_used = 0
     try:
         for i in range(MAX_TOOL_ROUNDS):
+            rounds_used = i + 1
             kwargs: dict = {"model": MODEL, "messages": messages, "tools": TOOLS_ALL}
             if i == MAX_TOOL_ROUNDS - 1:
                 kwargs["tool_choice"] = "none"
@@ -1006,16 +1032,33 @@ def _run_chat_locked(
             # the customer-visible reply alongside the NEXT round's real answer.
             # Only the final (no-tool-calls) round's text is flushed downstream.
             buffered: list[str] = []
+            round_t0 = time.monotonic()
+            first_event_at: float | None = None
             with client.chat.completions.stream(
                 **kwargs, stream_options={"include_usage": True}
             ) as s:
                 for event in s:
+                    if first_event_at is None:
+                        first_event_at = time.monotonic()
                     if event.type == "content.delta":
                         buffered.append(event.delta)
                 final = s.get_final_completion()
 
-            add_usage(total, _usage_dict(getattr(final, "usage", None)))
+            round_usage = _usage_dict(getattr(final, "usage", None))
+            add_usage(total, round_usage)
             msg = final.choices[0].message
+            # One line per model round so prod latency can be attributed:
+            # rounds x (ttft + generation) is the whole story for a warm turn.
+            round_end = time.monotonic()
+            print(
+                f"[chat] round={i + 1}/{MAX_TOOL_ROUNDS} phone={phone} "
+                f"secs={round_end - round_t0:.2f} "
+                f"ttft={(first_event_at or round_end) - round_t0:.2f} "
+                f"prompt={round_usage['prompt']} cached={round_usage['cached']} "
+                f"completion={round_usage['completion']} msgs={len(messages)} "
+                f"tools={','.join(tc.function.name for tc in msg.tool_calls) if msg.tool_calls else '-'}",
+                file=sys.stderr,
+            )
 
             if msg.tool_calls:
                 tc_payload = [
@@ -1063,6 +1106,15 @@ def _run_chat_locked(
                                     pending_login_url = parsed.get("login_url")
                                 elif parsed.get("submitted"):
                                     ticket_filed = True
+                                    # A filed ticket IS the hand-off: mark the
+                                    # conversation awaiting a rep right here so
+                                    # the model never needs a separate
+                                    # escalate_to_human round (one full model
+                                    # call saved per hand-off). Echo it in the
+                                    # tool result so the model knows.
+                                    escalate_requested = True
+                                    parsed["escalated"] = True
+                                    result = json.dumps(parsed, ensure_ascii=False)
                                     # A filed ticket must not get a stray login
                                     # link appended by the safety net.
                                     pending_login_url = None
@@ -1095,9 +1147,12 @@ def _run_chat_locked(
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
                 continue
 
-            # Final round — no tool calls. Flush the buffered answer downstream.
-            for chunk in buffered:
-                yield {"type": "delta", "text": chunk}
+            # Final round — no tool calls. Flush the buffered answer downstream
+            # as ONE delta: WhatsApp has no streaming (the integration joins
+            # deltas into a single message anyway), and per-token events cost a
+            # threadpool hop + an HTTP chunk write each.
+            if buffered:
+                yield {"type": "delta", "text": "".join(buffered)}
             text = msg.content or ""
             # Deterministic login-link fallback (Remark 12): if the account status
             # returned a login_url this turn, the model is talking about logging in,
@@ -1119,6 +1174,13 @@ def _run_chat_locked(
                         file=sys.stderr,
                     )
             db.append_message(phone, "assistant", content=text)
+            print(
+                f"[chat] turn phone={phone} rounds={rounds_used} "
+                f"secs={time.monotonic() - turn_t0:.2f} prompt={total['prompt']} "
+                f"cached={total['cached']} completion={total['completion']} "
+                f"reply_chars={len(text)}",
+                file=sys.stderr,
+            )
             yield {"type": "done", "usage": total}
             return
     except Exception as e:

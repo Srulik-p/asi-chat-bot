@@ -289,14 +289,22 @@ def append_message(
             )
 
 
-def load_history(phone_number: str) -> list[dict]:
-    """Return messages for `phone_number` in OpenAI chat-completion shape."""
+def load_history(phone_number: str, limit: Optional[int] = None) -> list[dict]:
+    """Return messages for `phone_number` in OpenAI chat-completion shape.
+
+    `limit` returns only the newest N rows (still in chronological order) —
+    the chat loop replays a bounded window, so it should not pull a months-old
+    log over the wire every turn. None returns the full log (human-facing
+    /chat/history)."""
     with _engine.connect() as conn:
-        rows = conn.execute(
-            select(messages_table)
-            .where(messages_table.c.phone_number == phone_number)
-            .order_by(messages_table.c.id)
-        ).mappings().all()
+        stmt = select(messages_table).where(messages_table.c.phone_number == phone_number)
+        if limit is None:
+            rows = conn.execute(stmt.order_by(messages_table.c.id)).mappings().all()
+        else:
+            rows = conn.execute(
+                stmt.order_by(messages_table.c.id.desc()).limit(limit)
+            ).mappings().all()
+            rows.reverse()
     out: list[dict] = []
     for r in rows:
         m: dict = {"role": r["role"], "content": r["content"]}

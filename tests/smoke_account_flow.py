@@ -81,9 +81,11 @@ st = json.loads(server._account_status_for(phone))
 assert st["is_premium"] is False and st["labels"] == [{"id": "l3", "name": "expired"}], st
 print("5. re-login upsert -> status/labels updated")
 
-# 6) Stale login (>72h since last login) -> treated as logged_in false + stale flag
+# 6) Stale login (>ACCOUNT_FRESHNESS_HOURS since last login) -> still answers
+#    from the cached data, but flagged stale + a login_url to refresh.
 import datetime as _dt  # noqa: E402
 
+assert server.ACCOUNT_FRESHNESS_HOURS == 48, server.ACCOUNT_FRESHNESS_HOURS
 stale_ts = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=server.ACCOUNT_FRESHNESS_HOURS + 1)
 with db._engine.begin() as conn:
     conn.execute(
@@ -92,9 +94,18 @@ with db._engine.begin() as conn:
         .values(updated_at=stale_ts)
     )
 st = json.loads(server._account_status_for(phone))
-assert st["logged_in"] is False and st.get("stale") is True, st
+assert st["logged_in"] is True and st.get("stale") is True, st
+assert st["is_premium"] is False and st["labels"] == [{"id": "l3", "name": "expired"}], st
+assert st["nickname"] == "דני", st
+assert st["hours_since_login"] >= server.ACCOUNT_FRESHNESS_HOURS, st
 assert st["login_url"].startswith("https://qa.sugardaddy.co.il/sign-in?phoneNumber="), st
-print("6. stale login (>72h) -> logged_in=false, stale=true")
+assert "לא עדכני" in st["instructions"] and "login_url" in st["instructions"], st
+# Fresh login -> no stale fields at all (the model must not see a caveat).
+r = client.post("/auth/callback", json=payload, headers={"X-Webhook-Secret": "smoke-secret"})
+assert r.status_code == 204
+st = json.loads(server._account_status_for(phone))
+assert st["logged_in"] is True and "stale" not in st and "login_url" not in st, st
+print("6. stale login (>48h) -> logged_in=true + stale=true + data + login_url; fresh -> no caveat")
 
 # 7) /user/delete erases history + login row + conversation state.
 db.append_message(phone, "user", content="היי")
