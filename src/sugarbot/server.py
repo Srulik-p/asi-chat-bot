@@ -40,8 +40,12 @@ POST /user/delete
 POST /auth/callback
     Headers: X-Webhook-Secret: <AUTH_CALLBACK_SECRET>
     Body:    { phoneNumber, user:{id,nickname,isPremium,gender?,labels:[{id,name}]}, accessToken }
-    Effect:  upsert users row by phoneNumber, then push a "connected" message
-             to the user via the outbound sender (best-effort, in background).
+    Effect:  upsert users row by phoneNumber, then push a continuation message
+             to the user via the outbound sender (best-effort, in background):
+             the conversation is replayed through the model with the just-
+             refreshed account data, so the customer gets the ANSWER to what
+             they were asking before the login link rather than a bare "we see
+             you connected" that makes them ask again.
 
 POST /maintenance/sweep-idle
     Headers: X-Internal-Secret
@@ -281,31 +285,6 @@ class AuthCallback(BaseModel):
     accessToken: str
 
 
-def _connected_message(nickname: str | None) -> str:
-    """The 'I see you connected' greeting pushed right after a successful login.
-
-    Continuation wording, not a fresh greeting: the common case is a customer
-    who was mid-issue, got sent the login link, and came back — "במה אפשר
-    לעזור?" would reset the conversation and force them to repeat themselves.
-    """
-    hi = f"היי {nickname}, " if nickname else "היי, "
-    return (
-        hi
-        + "אנחנו רואים שהתחברת בהצלחה 🙂 עכשיו אפשר לראות את הסטטוס שלך - "
-        + "ואפשר להמשיך מאיפה שעצרנו."
-    )
-
-
-def _notify_connected(phone: str, message: str) -> None:
-    """Push the connected greeting and, on success, record it in the chat history.
-
-    Takes the per-phone lock so the greeting row can never land in the middle
-    of an in-flight chat turn's tool round (which would poison the replay)."""
-    with _phone_lock(phone):
-        if notifier.send_message(phone, message):
-            db.append_message(phone, "assistant", content=message)
-
-
 @app.post("/auth/callback", status_code=status.HTTP_204_NO_CONTENT)
 def auth_callback(
     payload: AuthCallback,
@@ -324,11 +303,11 @@ def auth_callback(
         gender=payload.user.gender,
         labels=[l.model_dump() for l in payload.user.labels],
     )
-    # Push "I see you connected" out-of-band so the callback returns 204 fast and
-    # the (best-effort) send can't block or fail the auth flow.
-    background_tasks.add_task(
-        _notify_connected, payload.phoneNumber, _connected_message(payload.user.nickname)
-    )
+    # Push the post-login message out-of-band so the callback returns 204 fast
+    # and the (best-effort) send can't block or fail the auth flow. _notify_login
+    # lives further down, next to the chat machinery it replays the conversation
+    # through (see "post-login continuation").
+    background_tasks.add_task(_notify_login, payload.phoneNumber, payload.user.nickname)
 
 
 # ---------- /chat ----------
@@ -544,14 +523,19 @@ def _not_logged_in(phone: str) -> str:
     )
 
 
+def _ago_phrase(hours: float) -> str:
+    """Hebrew 'about N days/hours' for an elapsed span."""
+    days = int(hours // 24)
+    if days >= 2:
+        return f"כ-{days} ימים"
+    return f"כ-{int(hours)} שעות"
+
+
 def _stale_note(age_hours: float | None) -> str:
     """Hebrew 'this is from your last login N ago' phrase for the model."""
     if age_hours is None:
         return "מועד ההתחברות האחרונה לא ידוע"
-    days = int(age_hours // 24)
-    if days >= 2:
-        return f"ההתחברות האחרונה הייתה לפני כ-{days} ימים"
-    return f"ההתחברות האחרונה הייתה לפני כ-{int(age_hours)} שעות"
+    return f"ההתחברות האחרונה הייתה לפני {_ago_phrase(age_hours)}"
 
 
 def _account_status_for(phone: str) -> str:
@@ -960,23 +944,25 @@ def _run_chat(
         yield from _run_chat_locked(phone, user_message, media)
 
 
-def _run_chat_locked(
-    phone: str, user_message: str, media: list["MediaItem"] | None = None
-) -> Iterator[dict]:
-    media = media or []
-    # Store the raw text plus a placeholder note for any attachment. The bytes
-    # themselves are attached to the live request below, not persisted.
-    db.append_message(phone, "user", content=user_message + _media_placeholder(media))
+def _prepare_messages(
+    phone: str,
+    history: list[dict],
+    user_message: str = "",
+    media: list["MediaItem"] | None = None,
+) -> list[dict]:
+    """Build the LLM-facing messages list for a conversation.
 
-    # Build the LLM-facing messages list. scrub_messages redacts emails/phones/IDs
-    # from user-role content only; the stored DB rows keep the raw values for
-    # human-rep visibility.
-    # Replay only the most recent window to the model (full log stays in the
-    # DB, and is only fetched that far — a months-old thread must not be
-    # shipped over the wire every turn). A slice can cut an assistant
-    # tool_calls turn off from its tool results; repair_tool_calls below drops
-    # the dangling half cleanly.
-    history = db.load_history(phone, limit=HISTORY_MAX_MESSAGES)
+    scrub_messages redacts emails/phones/IDs from user-role content only; the
+    stored DB rows keep the raw values for human-rep visibility. `history` is
+    already the bounded replay window (see HISTORY_MAX_MESSAGES) — its slice
+    boundary can cut an assistant tool_calls turn off from its tool results, so
+    repair_tool_calls drops the dangling half cleanly and a single poisoned
+    turn can't 400 the conversation forever.
+
+    Shared by a chat turn and the post-login continuation, so both reason over
+    exactly the same conversation.
+    """
+    media = media or []
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
     messages = scrub_messages(messages)
     # Attach this turn's media to the last (current) user message as multimodal
@@ -990,8 +976,6 @@ def _run_chat_locked(
                 *_media_content_parts(media),
             ],
         }
-    # Heal any dangling tool-call pairs left by an earlier interrupted turn so a
-    # single poisoned turn can't 400 the conversation forever.
     messages = repair_tool_calls(messages)
 
     # Surface any recently-filed support ticket as context. Inserted right after
@@ -1000,7 +984,40 @@ def _run_chat_locked(
     ticket_note = _open_ticket_note(phone)
     if ticket_note:
         messages.insert(1, {"role": "system", "content": ticket_note})
+    return messages
 
+
+def _run_chat_locked(
+    phone: str, user_message: str, media: list["MediaItem"] | None = None
+) -> Iterator[dict]:
+    media = media or []
+    # Store the raw text plus a placeholder note for any attachment. The bytes
+    # themselves are attached to the live request below, not persisted.
+    db.append_message(phone, "user", content=user_message + _media_placeholder(media))
+    # Replay only the most recent window to the model (the full log stays in the
+    # DB, and is only fetched that far — a months-old thread must not be shipped
+    # over the wire every turn).
+    history = db.load_history(phone, limit=HISTORY_MAX_MESSAGES)
+    yield from _run_rounds(phone, _prepare_messages(phone, history, user_message, media))
+
+
+def _run_rounds(
+    phone: str,
+    messages: list[dict],
+    persist_reply: bool = True,
+    reply_out: list[str] | None = None,
+) -> Iterator[dict]:
+    """Drive the OpenAI tool-call loop over `messages`, yielding NDJSON events.
+
+    Every round the model asks for is persisted as it happens (the assistant
+    tool_calls turn plus one tool row per call), so the next call can rebuild
+    the history from scratch. `persist_reply=False` leaves the FINAL assistant
+    row to the caller — the post-login push records only what the outbound
+    channel actually delivered; `reply_out` then receives that reply, so a
+    non-streaming caller never has to reassemble it from the delta events.
+
+    The caller must already hold the conversation's per-phone lock.
+    """
     total = empty_usage()
     # Safety-net for Remark 12 ("login link often not sent"): whenever a tool
     # resolves to a not-logged-in status with a login_url — get_account_status,
@@ -1173,7 +1190,10 @@ def _run_chat_locked(
                         f"[chat] login_url withheld for {phone}: reply does not mention login",
                         file=sys.stderr,
                     )
-            db.append_message(phone, "assistant", content=text)
+            if reply_out is not None:
+                reply_out.append(text)
+            if persist_reply:
+                db.append_message(phone, "assistant", content=text)
             print(
                 f"[chat] turn phone={phone} rounds={rounds_used} "
                 f"secs={time.monotonic() - turn_t0:.2f} prompt={total['prompt']} "
@@ -1190,7 +1210,7 @@ def _run_chat_locked(
         # the WhatsApp integration may forward `message` verbatim.
         ref = uuid.uuid4().hex[:12]
         print(
-            f"[chat] _run_chat failed for {phone} ref={ref}: {type(e).__name__}: {e}",
+            f"[chat] _run_rounds failed for {phone} ref={ref}: {type(e).__name__}: {e}",
             file=sys.stderr,
         )
         traceback.print_exc()
@@ -1208,6 +1228,158 @@ def _run_chat_locked(
                     f"[chat] mark_escalated failed for {phone}: {type(e).__name__}: {e}",
                     file=sys.stderr,
                 )
+
+
+# ---------- post-login continuation ----------
+# What goes out the moment /auth/callback lands. The customer is almost always
+# mid-request when we hand them the login link, so a fixed "I see you connected"
+# costs them a second round trip: they have to ask the same thing again. Instead
+# we replay the conversation through the model with the just-refreshed account
+# data attached and push the actual answer — including filing the ticket that
+# the login gated in the first place. Every failure path degrades to the fixed
+# greeting, so the customer always hears something.
+
+# Past this gap the pending request is probably not pending any more; the note
+# tells the model to re-confirm instead of acting on a weeks-old request.
+POST_LOGIN_STALE_HOURS = 24
+
+
+def _connected_message(nickname: str | None) -> str:
+    """Fixed fallback greeting: nothing to continue, or generation failed.
+
+    Continuation wording, not a fresh greeting: the common case is a customer
+    who was mid-issue, got sent the login link, and came back — "במה אפשר
+    לעזור?" would reset the conversation and force them to repeat themselves.
+    """
+    hi = f"היי {nickname}, " if nickname else "היי, "
+    return (
+        hi
+        + "אנחנו רואים שהתחברת בהצלחה 🙂 עכשיו אפשר לראות את הסטטוס שלך - "
+        + "ואפשר להמשיך מאיפה שעצרנו."
+    )
+
+
+def _post_login_note(status_json: str, idle_hours: float | None) -> str:
+    """System note turning "the customer logged in" into a concrete instruction:
+    answer the request that was open, now, with the fresh account data."""
+    lines = [
+        "הערת מערכת - אירוע במערכת (זו אינה הודעה מהלקוח): הלקוח בדיוק סיים "
+        "להתחבר לחשבון האתר דרך קישור ההתחברות שנשלח אליו.",
+        "",
+        "עכשיו את/ה שולח/ת ללקוח הודעה אחת ביוזמתך. המטרה: להמשיך בדיוק מאיפה "
+        "שהשיחה נעצרה ולתת את התשובה עצמה - לא רק לאשר שההתחברות הצליחה.",
+        "",
+        "1. מצא/י בהיסטוריה את הבקשה הפתוחה של הלקוח - מה הוא שאל או ביקש לפני "
+        "שנשלח אליו קישור ההתחברות. זו הבקשה שההתחברות באה לפתוח.",
+        "2. ענה/י עליה עכשיו במלואה, על סמך נתוני החשבון המעודכנים שלמטה. אם "
+        "דרוש מידע עובדתי (מחיר, נוהל, מדיניות) - קרא/י קודם מהמאגר עם "
+        "read_kb ורק אז ענה/י.",
+        "3. אם הבקשה הפתוחה מחייבת פנייה לצוות וההתחברות היא מה שחסם אותה "
+        "(דיווח, חיוב כפול/שגוי, בירור חסימה, בקשה לנציג) - פתח/י אותה עכשיו "
+        "עם submit_support_ticket, ועדכן/י את הלקוח שנציג יחזור אליו.",
+        "4. אם אין בקשה פתוחה שההתחברות פותחת - אשר/י בקצרה ובחום שההתחברות "
+        "הצליחה, מסר/י את סטטוס החשבון הרלוונטי, ושאל/י במה עוד אפשר לעזור.",
+        "",
+        "כללים להודעה הזו:",
+        "- אל תסתפק/י ב'אני רואה שהתחברת' ואל תבקש/י מהלקוח לשאול שוב או לחזור "
+        "על עצמו - הוא כבר שאל, וזה בדיוק מה שאנחנו חוסכים לו כאן.",
+        "- אל תבקש/י מהלקוח להתחבר שוב ואל תשלח/י שום קישור התחברות - הוא "
+        "הרגע התחבר.",
+        "- הזכר/י את ההתחברות במשפט קצר אחד בפתיחה, ומשם ישר לתשובה.",
+        "- אל תפתח/י בברכת הפתיחה הקנונית - זו לא תחילת שיחה.",
+        "- הודעה אחת, בטון ובאורך הרגילים שלך, בלי להמציא פרטים.",
+    ]
+    if idle_hours is not None and idle_hours >= POST_LOGIN_STALE_HOURS:
+        lines += [
+            "",
+            f"שים/י לב: עברו {_ago_phrase(idle_hours)} מההודעה האחרונה בשיחה, "
+            "כך שייתכן שהבקשה הישנה כבר לא רלוונטית. במקרה כזה אל תפעל/י עליה "
+            "מיוזמתך (ובפרט אל תפתח/י פנייה לצוות) - מסור/י את סטטוס החשבון "
+            "ושאל/י אם עדיין דרושה עזרה באותו נושא.",
+        ]
+    lines += [
+        "",
+        "נתוני החשבון של הלקוח מההתחברות שהרגע הסתיימה - זהה למה ש-"
+        "get_account_status היה מחזיר עכשיו, אין צורך לקרוא לכלי שוב בשביל "
+        "הנתונים האלה:",
+        status_json,
+    ]
+    return "\n".join(lines)
+
+
+def _post_login_reply(phone: str) -> str:
+    """Generate the continuation answer for a customer who just logged in.
+
+    Returns "" when there is nothing to continue (no conversation yet), when
+    the row the callback just wrote can't be read back as logged in (answering
+    from a not-logged-in status would send them right back to a login link),
+    or when the model round failed — the caller falls back to the fixed
+    greeting in all three cases.
+    """
+    history = db.load_history(phone, limit=HISTORY_MAX_MESSAGES)
+    if not history:
+        return ""
+    status_json = _account_status_for(phone)
+    try:
+        if not json.loads(status_json).get("logged_in"):
+            return ""
+    except (json.JSONDecodeError, AttributeError):
+        return ""
+
+    last_at = db.last_message_at(phone)
+    idle_hours = (
+        (datetime.now(timezone.utc) - last_at).total_seconds() / 3600
+        if last_at is not None
+        else None
+    )
+    messages = _prepare_messages(phone, history)
+    # The event note goes LAST, not beside the system prompt: it is an
+    # instruction about the message to write right now, and the model has to
+    # read it against the conversation it has just replayed.
+    messages.append(
+        {"role": "system", "content": _post_login_note(status_json, idle_hours)}
+    )
+
+    reply_out: list[str] = []
+    for ev in _run_rounds(phone, messages, persist_reply=False, reply_out=reply_out):
+        if ev["type"] == "error":
+            return ""
+    return (reply_out[0] if reply_out else "").strip()
+
+
+def _notify_login(phone: str, nickname: str | None) -> None:
+    """Push the post-login message and, on success, record it in the history.
+
+    Holds the per-phone lock across the whole generation: the rows the model
+    rounds write must never land inside an in-flight chat turn's tool round
+    (that poisons every later replay), and a customer message arriving
+    meanwhile should wait and then see this reply in its history. Recording
+    only after a successful send keeps the log honest about what the customer
+    actually received."""
+    with _phone_lock(phone):
+        t0 = time.monotonic()
+        try:
+            text = _post_login_reply(phone)
+        except Exception as e:
+            # Never let the continuation take down the login push — the
+            # customer still gets the fixed greeting below.
+            print(
+                f"[auth] post-login continuation failed for {phone}: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
+            text = ""
+        generated = bool(text)
+        if not text:
+            text = _connected_message(nickname)
+        print(
+            f"[auth] post-login push phone={phone} generated={generated} "
+            f"secs={time.monotonic() - t0:.2f} chars={len(text)}",
+            file=sys.stderr,
+        )
+        if notifier.send_message(phone, text):
+            db.append_message(phone, "assistant", content=text)
 
 
 def _ndjson(events: Iterator[dict]) -> Iterator[bytes]:

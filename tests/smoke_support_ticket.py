@@ -135,16 +135,20 @@ assert files["reason"] == (None, "8ddc112a-e53a-4236-a9be-7f7f1db729ba"), files[
 assert files["text"] == (None, "לא מצליח להעלות תמונה"), files["text"]
 assert files["sourceEmail"] == (None, "user@example.com"), files.get("sourceEmail")
 assert files["sourcePhoneNumber"] == (None, "+972501234567"), files.get("sourcePhoneNumber")
+# Guest tickets carry the same channel tag as on-account ones (sources=WhatsApp),
+# so the team can tell a bot-filed ticket from a hand-filled web form.
+assert files["sources"] == (None, "WhatsApp"), files.get("sources")
 assert call["headers"]["Origin"] == "https://qa.sugardaddy.co.il", call["headers"]
 assert call["headers"]["Referer"] == "https://qa.sugardaddy.co.il/he/contact-us", call["headers"]
-print("2. submit_ticket -> multipart fields, headers, ticket_id/status parsed")
+print("2. submit_ticket -> multipart fields (incl. sources=WhatsApp), headers, ticket_id/status parsed")
 
 # 3) nested id/status containers + status fallback to "created"
 _next_body = {"data": {"ticketId": "42"}}
 res = contact.submit_ticket(reason="other", text="שאלה", source_phone="+972500000000")
 assert res["ticket_id"] == "42" and res["ticket_status"] == "created", res
 files = _calls[-1]["files"]
-assert "sourceEmail" not in files and set(files) == {"reason", "text", "sourcePhoneNumber"}, files
+assert "sourceEmail" not in files, files
+assert set(files) == {"reason", "text", "sourcePhoneNumber", "sources"}, files
 print("3. nested id container parsed; status falls back to 'created'; optional email omitted")
 
 # 4) unknown reason is a handled failure (no network call, no crash)

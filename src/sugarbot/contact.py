@@ -56,9 +56,13 @@ Env configuration (all optional):
                            covers admin failures, and the thread fetch
                            runs on the chat hot path)
 
-Multipart fields posted (mirrors the site frontend's FormData):
+Multipart fields posted (mirrors the site frontend's FormData, plus `sources`):
   reason               required — a ContactUsReason optionId
   text                 the message body
+  sources              "WhatsApp" — channel tag, mirrors the admin path's
+                       sources:["WhatsApp"]. NOT sent by the site's own form;
+                       the endpoint accepts it (QA-verified) but does not echo
+                       it back, so whether it is stored needs a help-desk look
   sourceEmail          optional — customer email (unauth only)
   sourcePhoneNumber    optional — customer phone (unauth only)
   image                optional — file upload (not used by the tool yet)
@@ -523,6 +527,13 @@ def submit_ticket(
     files: dict[str, tuple] = {
         "reason": (None, reason_id),
         "text": (None, text or ""),
+        # Channel tag, matching submit_admin_ticket's sources=["WhatsApp"]:
+        # without it a guest ticket is indistinguishable from someone filling
+        # the web form by hand (we even send the contact-us Origin/Referer).
+        # The web form itself sends no `sources`, so this is an extra field —
+        # verified against QA (2026-08-23) to be accepted, not rejected; if the
+        # backend whitelists DTO fields it is silently dropped rather than 400.
+        "sources": (None, "WhatsApp"),
     }
     if source_email:
         files["sourceEmail"] = (None, source_email)

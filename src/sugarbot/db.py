@@ -316,6 +316,21 @@ def load_history(phone_number: str, limit: Optional[int] = None) -> list[dict]:
     return out
 
 
+def last_message_at(phone_number: str) -> Optional[datetime]:
+    """Timestamp (UTC) of the newest message in the conversation, or None.
+
+    Used by the post-login push to tell "the customer just asked this" apart
+    from "this thread has been cold for weeks"."""
+    with _engine.connect() as conn:
+        row = conn.execute(
+            select(messages_table.c.created_at)
+            .where(messages_table.c.phone_number == phone_number)
+            .order_by(messages_table.c.id.desc())
+            .limit(1)
+        ).first()
+    return _as_utc(row[0]) if row else None
+
+
 def clear_history(phone_number: str) -> int:
     with _engine.begin() as conn:
         result = conn.execute(

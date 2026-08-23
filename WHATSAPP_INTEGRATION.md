@@ -120,8 +120,9 @@ Content-Type: application/json
 ```
 
 Also point the outbound sender in `src/sugarbot/notifier.py` at this same
-send call, so the `/auth/callback` "connected" push and the idle-sweep
-warnings/closures reach WhatsApp too — today they only reach the demo.
+send call, so the `/auth/callback` post-login push (the model-generated
+continuation answer) and the idle-sweep warnings/closures reach WhatsApp
+too — today they only reach the demo.
 
 ---
 
