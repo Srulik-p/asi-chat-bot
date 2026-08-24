@@ -769,9 +769,11 @@ def _submit_ticket_for(phone: str, args: dict) -> str:
     login_url, so the customer can log in and the ticket lands on their account
     (with their userId). Only an explicit no_account=true from the model — the
     customer said they have no account or could not log in — files anonymously.
-    Admin-path failures still fall back to the unauth contact-form endpoint so
-    a logged-in customer always ends up with a ticket. The phone comes from the
-    conversation identity (kept out of the model), attached as sourcePhoneNumber.
+    Anonymous tickets go through the same admin endpoint, just without a
+    userId; the unauth contact-form endpoint remains the fallback (admin
+    unconfigured or failing) so the customer always ends up with a ticket. The
+    phone comes from the conversation identity (kept out of the model),
+    attached as sourcePhoneNumber.
     """
     reason = args.get("reason", "")
     text = args.get("text", "")
@@ -820,7 +822,7 @@ def _submit_ticket_for(phone: str, args: dict) -> str:
 
     res = None
     on_account = False
-    if external_id and contact.admin_available():
+    if contact.admin_available():
         res = contact.submit_admin_ticket(
             reason=reason,
             text=text,
@@ -829,10 +831,11 @@ def _submit_ticket_for(phone: str, args: dict) -> str:
             source_email=email,
         )
         if res["ok"]:
-            on_account = True
+            on_account = bool(external_id)
         else:
             print(
-                f"[chat] admin ticket failed for {phone} "
+                f"[chat] admin ticket ({'on-account' if external_id else 'guest'}) "
+                f"failed for {phone} "
                 f"(http={res['http_status']} {res['detail']}); falling back to unauth",
                 file=sys.stderr,
             )

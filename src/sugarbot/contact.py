@@ -1,17 +1,21 @@
-"""Support-ticket sender (site "contact us" form).
+"""Support-ticket senders (admin help desk first, site "contact us" fallback).
 
-Files a support ticket into the site's own help-desk system — the same
+Files a support ticket into the site's help-desk system, so the assistant can
+open a ticket on the customer's behalf instead of telling them to go fill the
+web form themselves.
+
+The primary path is the admin backend (`submit_admin_ticket`): a JSON POST
+authenticated with ADMIN_API_KEY as an `x-api-key` header. When the
+customer's WhatsApp number is linked to a site account (we know their
+userId), the ticket is filed ON that account, so the team sees it attached
+to the user. Without a userId the SAME endpoint files a guest (anonymous)
+ticket — the payload simply omits the field (verified against prod
+adm-backend 2026-08-24).
+
+`submit_ticket` is the fallback when the admin path is unconfigured or fails:
+it posts `multipart/form-data` to the "unauth" support endpoint — the same
 backend the public contact form (https://sugardaddy.co.il/he/contact-us)
-posts to. Lets the assistant open a ticket on the customer's behalf instead
-of telling them to go fill the web form themselves.
-
-The form posts `multipart/form-data` to the "unauth" support endpoint.
-
-There is a second, authenticated path: when the customer's WhatsApp number is
-linked to a site account (we know their userId), `submit_admin_ticket` files
-the ticket ON that account via the admin backend (JSON POST authenticated
-with ADMIN_API_KEY as an `x-api-key` header), so the team sees it attached
-to the user instead of anonymous.
+posts to.
 The same admin backend also serves a ticket's message thread
 (`fetch_admin_ticket_messages`), which the server surfaces to the assistant
 so it can quote the team's actual reply instead of a generic "it's with the
@@ -814,15 +818,17 @@ def submit_admin_ticket(
     reason: str,
     text: str,
     *,
-    user_id: str,
+    user_id: str | None = None,
     source_phone: str,
     source_email: str | None = None,
 ) -> dict:
-    """POST a support ticket onto a site account via the admin API.
+    """POST a support ticket via the admin API.
 
-    `user_id` is the site account id (users.external_id). Returns the same
+    `user_id` is the site account id (users.external_id); with it the ticket
+    is filed ON that account, without it the ticket files as a guest
+    (anonymous) one — the payload omits `userId` entirely. Returns the same
     result dict as submit_ticket; never raises — callers fall back to the
-    anonymous submit_ticket path on ok=False.
+    unauth submit_ticket path on ok=False.
     """
     if not admin_available():
         return _result(False, detail="admin API not configured")
@@ -837,7 +843,6 @@ def submit_admin_ticket(
     # is the API's documented initial state (was "ForCustomerService" until
     # 2026-08-17) — it must not be the untriaged literal "None".
     payload = {
-        "userId": user_id,
         "sources": ["WhatsApp"],
         "reason": reason_id,
         "text": text or "",
@@ -848,6 +853,10 @@ def submit_admin_ticket(
         "sourceUserId": "",
         "isReplyFromCustomer": False,
     }
+    if user_id:
+        # Guest tickets omit the key (not empty-string it): a present userId
+        # may be validated as a UUID, an absent one can't fail that check.
+        payload["userId"] = user_id
 
     return _send_ticket_request(
         "admin ticket",

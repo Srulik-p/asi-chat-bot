@@ -8,8 +8,9 @@ Verifies reason-key resolution, the multipart fields the backend expects, that
 the conversation phone is attached as sourcePhoneNumber, ticket id/status
 parsing from the response, DB persistence + open-ticket context, success/failure
 handling, that the tool is registered in the server's tool list, and the
-admin (on-account) path: JSON payload + bearer auth, server-side routing for
-account-linked conversations, and fallback to the anonymous unauth endpoint.
+admin path: JSON payload + bearer/x-api-key auth, on-account (userId) vs guest
+(no userId) payloads, server-side routing for account-linked and anonymous
+conversations, and fallback to the unauth contact-form endpoint.
 """
 import io as _io
 import json as _json
@@ -276,6 +277,23 @@ assert call["json"] == {
     "sourceUserId": "",
     "isReplyFromCustomer": False,
 }, call["json"]
+# without user_id the same endpoint files a guest ticket: identical payload
+# minus the userId key (omitted entirely, not empty-stringed)
+_calls.clear()
+_next_body = {"id": "ADM-2G", "status": "None"}
+res = contact.submit_admin_ticket(
+    reason="technical",
+    text="אין לי חשבון",
+    source_phone="+972501234567",
+    source_email="guest@example.com",
+)
+assert res["ok"] is True and res["ticket_id"] == "ADM-2G", res
+call = _calls[-1]
+assert call["url"] == "https://admin.example/support", call
+assert "userId" not in call["json"], call["json"]
+assert call["json"]["sourcePhoneNumber"] == "+972501234567", call["json"]
+assert call["json"]["sourceEmail"] == "guest@example.com", call["json"]
+assert call["json"]["sources"] == ["WhatsApp"], call["json"]
 # a meaningful echoed status passes through to DB/context untouched
 _next_body = {"id": "ADM-9", "status": "ForCustomerService"}
 res = contact.submit_admin_ticket(
@@ -890,7 +908,8 @@ contact.SUGAR_ADMIN_API = "test-admin-token"
 contact.requests.post = _fake_post
 print("10b. managed login: lazy login+cache, expiry refresh, 401/403 retry, login-down fallback, thread fetch, masking")
 
-# 11) server routing: linked account -> admin path (on_account); anonymous -> unauth
+# 11) server routing: linked account -> admin path (on_account); anonymous ->
+#     login gate, then a guest admin ticket (same endpoint, no userId)
 phone2 = "+972502223344"
 db.upsert_user(phone2, external_id="site-uuid-9", nickname="דנה", is_premium=True, labels=[])
 _calls.clear()
@@ -921,15 +940,21 @@ result = server._submit_ticket_for(
 parsed = _json.loads(result)
 assert parsed["submitted"] is False and parsed.get("login_required") is True, parsed
 assert _calls == [], _calls
-# customer has no account / can't log in -> explicit no_account files a guest ticket
+# customer has no account / can't log in -> explicit no_account files a guest
+# ticket through the SAME admin endpoint, just without a userId
+_next_body = {"id": "ADM-3", "status": "None"}
 result = server._submit_ticket_for(
     "+972509998877", {"reason": "technical", "text": "תקלה", "no_account": True}
 )
 parsed = _json.loads(result)
 assert parsed["submitted"] is True and parsed["on_account"] is False, parsed
-assert len(_calls) == 1 and _calls[0]["url"] == contact.SUPPORT_TICKET_URL, _calls
-assert _calls[0]["files"] is not None, "anonymous path must stay multipart"
-print("11. routing: linked -> admin; anonymous -> login gate, then unauth only with no_account")
+assert len(_calls) == 1 and _calls[0]["url"] == "https://admin.example/support", _calls
+assert _calls[0]["files"] is None, "guest admin ticket must POST json, not multipart"
+assert "userId" not in _calls[0]["json"], _calls[0]["json"]
+assert _calls[0]["json"]["sourcePhoneNumber"] == "+972509998877", _calls[0]["json"]
+rows = db.recent_support_tickets("+972509998877")
+assert rows and rows[0]["ticket_id"] == "ADM-3", rows
+print("11. routing: linked -> admin (userId); anonymous -> login gate, then guest admin ticket with no_account")
 
 # 12) admin failure -> unauth fallback (customer always gets a ticket);
 #     missing token -> admin never attempted
@@ -953,6 +978,19 @@ assert [c["url"] for c in _calls] == [
     "https://admin.example/support",
     contact.SUPPORT_TICKET_URL,
 ], _calls
+# guest tickets get the same safety net: admin 500 -> unauth multipart fallback
+_calls.clear()
+result = server._submit_ticket_for(
+    "+972509998877", {"reason": "technical", "text": "עדיין תקלה", "no_account": True}
+)
+parsed = _json.loads(result)
+assert parsed["submitted"] is True and parsed["on_account"] is False, parsed
+assert [c["url"] for c in _calls] == [
+    "https://admin.example/support",
+    contact.SUPPORT_TICKET_URL,
+], _calls
+assert "userId" not in _calls[0]["json"], _calls[0]["json"]
+assert _calls[1]["files"] is not None, "unauth fallback must stay multipart"
 contact.requests.post = _fake_post
 contact.SUGAR_ADMIN_API = ""
 _calls.clear()
@@ -961,7 +999,7 @@ result = server._submit_ticket_for(phone2, {"reason": "help_desk", "text": "עו
 parsed = _json.loads(result)
 assert parsed["submitted"] is True and parsed["on_account"] is False, parsed
 assert len(_calls) == 1 and _calls[0]["url"] == contact.SUPPORT_TICKET_URL, _calls
-print("12. admin failure -> unauth fallback; no token -> straight to unauth")
+print("12. admin failure (linked + guest) -> unauth fallback; no token -> straight to unauth")
 
 # 13) both paths fail -> submitted=false (the model must NOT claim a ticket was
 #     filed), nothing persisted
