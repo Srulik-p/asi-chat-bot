@@ -922,6 +922,29 @@ assert len(_calls) == 1 and _calls[0]["url"] == "https://admin.example/support",
 assert _calls[0]["json"]["userId"] == "site-uuid-9", _calls[0]["json"]
 rows = db.recent_support_tickets(phone2)
 assert rows and rows[0]["ticket_id"] == "ADM-2", rows
+# A STALE login (older than ACCOUNT_FRESHNESS_HOURS) must still file ON the
+# account: the freshness gate covers get_account_status only, and the gate's own
+# instructions promise the customer no re-login is needed to reach a rep.
+import datetime as _dt  # noqa: E402
+
+_stale_ts = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(
+    hours=server.ACCOUNT_FRESHNESS_HOURS + 1
+)
+with db._engine.begin() as _conn:
+    _conn.execute(
+        db.users_table.update()
+        .where(db.users_table.c.phone_number == phone2)
+        .values(updated_at=_stale_ts)
+    )
+assert _json.loads(server._account_status_for(phone2))["logged_in"] is False, "row should read stale"
+_calls.clear()
+_next_body = {"id": "ADM-2S", "status": "None"}
+result = server._submit_ticket_for(phone2, {"reason": "report", "text": "דיווח על משתמש"})
+parsed = _json.loads(result)
+assert parsed["submitted"] is True and parsed["on_account"] is True, parsed
+assert parsed.get("login_required") is None, "a stale login must not gate ticket filing"
+assert len(_calls) == 1 and _calls[0]["json"]["userId"] == "site-uuid-9", _calls
+print("11s. stale linked row (>freshness window) still files ON the account, no login gate")
 _calls.clear()
 _next_body = {"id": "TKT-3003", "status": "open"}
 # anonymous conversation WITHOUT no_account -> no ticket yet: ask to log in first

@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 import os
 import sys
 import threading
@@ -82,6 +83,7 @@ from pydantic import BaseModel
 
 from sugarbot import contact, db, notifier
 from sugarbot.assistant import (
+    ACCOUNT_FRESHNESS_HOURS,
     MAX_TOOL_ROUNDS,
     MODEL,
     REASONING_EFFORT,
@@ -110,12 +112,9 @@ _ON_CLOUD_RUN = bool(os.getenv("K_SERVICE"))
 # QA login links (logging in on QA never fires the prod /auth/callback, which
 # dead-loops the whole identification flow).
 LOGIN_URL_BASE = os.getenv("LOGIN_URL_BASE", "https://qa.sugardaddy.co.il/sign-in")
-# How long cached login data counts as current. Past this get_account_status
-# still returns the cached snapshot (labels/premium) — the customer should not
-# have to log in again just to get an answer — but flags it stale so the bot
-# says the info is from their last login and may have changed, and offers a
-# login link to refresh.
-ACCOUNT_FRESHNESS_HOURS = int(os.getenv("ACCOUNT_FRESHNESS_HOURS", "48"))
+# ACCOUNT_FRESHNESS_HOURS (imported above) is defined in assistant.py because
+# the system prompt states the threshold to the customer and must be rendered
+# from the same value this module gates on.
 # Inactivity auto-close: warn after the conversation has been waiting on the
 # customer for INACTIVITY_WARN_HOURS, then close it INACTIVITY_CLOSE_HOURS after
 # the last activity if still no reply. Driven by /maintenance/sweep-idle.
@@ -362,6 +361,11 @@ ACCOUNT_TOOLS = [
                 "Returns logged_in plus, if logged in, the "
                 "membership details (nickname, is_premium, gender, labels); if not "
                 "logged in, a login_url to send the customer so they can sign in. "
+                f"A last login older than {ACCOUNT_FRESHNESS_HOURS} hours counts "
+                "as NOT logged in: the cached details are withheld (stale: true) "
+                "because they may have changed since — ask the customer to sign "
+                "in again to refresh them (filing a support ticket still works "
+                "without re-login). "
                 "It does NOT return subscription dates — never invent an end/renewal "
                 "date. Use gender to tailor the answer (women have free access — "
                 "never tell a woman she is not premium). Takes no arguments — the "
@@ -418,7 +422,9 @@ CONTACT_TOOLS = [
                 "yet; retry after login, or with no_account=true. Do NOT use it for "
                 "questions you can answer yourself from the knowledge base, and for "
                 "irreversible actions (e.g. account removal) only after the customer "
-                "has explicitly confirmed. Provide `text` (a clear Hebrew summary of "
+                "has explicitly confirmed. If the knowledge base defines a fixed "
+                "confirmation (נוסח קבוע) for the scenario you just filed, send that "
+                "wording instead of the generic working-hours line. Provide `text` (a clear Hebrew summary of "
                 "what the customer needs, with any detail the team needs); include "
                 "`email` only if the customer gave one. The customer's phone is "
                 "attached automatically from the conversation — never ask for it or "
@@ -511,15 +517,35 @@ def _login_url_for(phone: str) -> str:
     return f"{LOGIN_URL_BASE}?phoneNumber={quote(phone, safe='')}"
 
 
+# One wording for "send the login_url value itself, as a clickable link". Three
+# gates hand it to the model (no row, stale row, unlinked ticket); when the
+# phrasing was copied per gate a fix to one silently left the others behind.
+_SEND_LOGIN_LINK = (
+    "ושלח/י לו את הערך של השדה login_url (כתובת ה-URL המלאה) כקישור לחיץ. "
+    "אל תכתוב/י את המילה 'login_url' או סוגריים - רק את הכתובת עצמה."
+)
+
+
+def _stamped(payload: dict) -> str:
+    """Serialize an account-status payload with an internal retrieval stamp.
+
+    `as_of` never reaches the model (_model_view strips it on the way out) — it
+    exists so the same row, replayed from history on a later turn, can be
+    recognised as expired instead of answered from. See _sanitize_account_results.
+    """
+    return json.dumps(
+        {**payload, "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds")},
+        ensure_ascii=False,
+    )
+
+
 def _not_logged_in(phone: str) -> str:
     instructions = (
         "הלקוח לא מחובר. בקש/י ממנו להתחבר כדי שתוכל/י לראות את הסטטוס שלו, "
-        "ושלח/י לו את הערך של השדה login_url (כתובת ה-URL המלאה) כקישור לחיץ. "
-        "אל תכתוב/י את המילה 'login_url' או סוגריים - רק את הכתובת עצמה."
+        + _SEND_LOGIN_LINK
     )
-    return json.dumps(
-        {"logged_in": False, "login_url": _login_url_for(phone), "instructions": instructions},
-        ensure_ascii=False,
+    return _stamped(
+        {"logged_in": False, "login_url": _login_url_for(phone), "instructions": instructions}
     )
 
 
@@ -532,48 +558,146 @@ def _ago_phrase(hours: float) -> str:
 
 
 def _stale_note(age_hours: float | None) -> str:
-    """Hebrew 'this is from your last login N ago' phrase for the model."""
+    """Hebrew 'your last login was N ago' opening for the stale gate.
+
+    The "- more than Nh -" appositive only reads correctly after a dated
+    phrase, so an undatable row gets the bare unknown-age wording instead of a
+    sentence that asserts an age nobody knows.
+    """
     if age_hours is None:
         return "מועד ההתחברות האחרונה לא ידוע"
-    return f"ההתחברות האחרונה הייתה לפני {_ago_phrase(age_hours)}"
+    return (
+        f"ההתחברות האחרונה הייתה לפני {_ago_phrase(age_hours)} - "
+        f"יותר מ-{ACCOUNT_FRESHNESS_HOURS} שעות"
+    )
 
 
 def _account_status_for(phone: str) -> str:
     """Resolve get_account_status for `phone`. Returns a JSON string (tool result).
 
     Login data is cached in the DB on /auth/callback. A missing row routes the
-    bot to the login step. A row older than ACCOUNT_FRESHNESS_HOURS is still
-    served (the customer should get an answer, not a login wall) but flagged
-    `stale` with the age and a login_url, so the bot answers from it while
-    saying it reflects their last login and may have changed since.
+    bot to the login step. A row older than ACCOUNT_FRESHNESS_HOURS is NOT
+    served — premium/labels can change on the site, so answering from an old
+    snapshot risks telling the customer the wrong thing. Instead the tool
+    returns a re-login gate (logged_in=false + stale=true + login_url): the bot
+    asks the customer to sign in again, the callback refreshes the row, and the
+    next call serves current data.
     """
     user = db.get_user_by_phone(phone)
     if user is None:
         return _not_logged_in(phone)
-    status: dict = {
-        "logged_in": True,
-        "nickname": user["nickname"],
-        "is_premium": user["is_premium"],
-        # May be None if the site hasn't sent it yet — bot falls back to
-        # gender-neutral phrasing when absent.
-        "gender": user.get("gender"),
-        "labels": user["labels"],
-    }
     if _login_is_stale(user):
         age_hours = _hours_since_login(user)
-        status["stale"] = True
-        status["hours_since_login"] = int(age_hours) if age_hours is not None else None
-        status["login_url"] = _login_url_for(phone)
-        status["instructions"] = (
-            f"הנתונים האלה הם מההתחברות האחרונה של הלקוח ({_stale_note(age_hours)}, "
-            f"יותר מ-{ACCOUNT_FRESHNESS_HOURS} שעות) ולכן ייתכן שהמידע לא עדכני. "
-            "ענה/י על סמך הנתונים האלה, אבל ציין/י בקצרה שהם נכונים למועד ההתחברות "
-            "האחרונה ואולי השתנו מאז. אם הלקוח רוצה סטטוס עדכני, או שהתשובה תלויה "
-            "במצב הנוכחי המדויק - הצע/י לו להתחבר שוב ושלח/י את הערך של השדה "
-            "login_url (כתובת ה-URL המלאה) כקישור לחיץ. אל תכתוב/י את המילה "
-            "'login_url' או סוגריים - רק את הכתובת עצמה."
+        instructions = (
+            f"{_stale_note(age_hours)}, ולכן אי אפשר להסתמך על הנתונים השמורים: "
+            "מנוי ותוויות יכולים להשתנות. אל תענה/י על שאלות חשבון מנתונים "
+            "ישנים ואל תנחש/י. בקש/י מהלקוח להתחבר שוב כדי שהמידע יתעדכן, "
+            + _SEND_LOGIN_LINK
+            + " אם הלקוח רוצה לפתוח פנייה לצוות או לדבר עם נציג - אין צורך "
+            "בהתחברות מחדש בשביל זה: קרא/י ל-submit_support_ticket כרגיל "
+            "והפנייה תיפתח על החשבון שלו."
         )
-    return json.dumps(status, ensure_ascii=False)
+        return _stamped(
+            {
+                "logged_in": False,
+                "stale": True,
+                # Ceil, not truncate: the gate fires above the threshold, so a
+                # floored 48.5h would report "48" next to its own "more than 48
+                # hours" claim.
+                "hours_since_login": math.ceil(age_hours) if age_hours is not None else None,
+                "login_url": _login_url_for(phone),
+                "instructions": instructions,
+            }
+        )
+    return _stamped(
+        {
+            "logged_in": True,
+            "nickname": user["nickname"],
+            "is_premium": user["is_premium"],
+            # May be None if the site hasn't sent it yet — bot falls back to
+            # gender-neutral phrasing when absent.
+            "gender": user.get("gender"),
+            "labels": user["labels"],
+        }
+    )
+
+
+_ACCOUNT_RESULT_EXPIRED = json.dumps(
+    {
+        "expired": True,
+        "instructions": (
+            "תוצאה ישנה של בדיקת חשבון מהשיחה - כבר לא בתוקף, והנתונים שבה "
+            "עלולים להיות שגויים היום. אל תענה/י ממנה על שאלות חשבון ואל "
+            "תצטט/י ממנה סטטוס, מנוי או תוויות. אם צריך את מצב החשבון עכשיו - "
+            "קרא/י שוב ל-get_account_status."
+        ),
+    },
+    ensure_ascii=False,
+)
+
+
+def _as_account_result(content) -> dict | None:
+    """Parse a persisted tool result, but only if it is an account-status one."""
+    if not isinstance(content, str) or not content.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    # submit_support_ticket results carry submitted/login_required, never
+    # logged_in, so they pass through untouched.
+    return parsed if isinstance(parsed, dict) and "logged_in" in parsed else None
+
+
+def _hours_since_stamp(stamp) -> float | None:
+    """Hours since an ISO-8601 stamp; None when missing or unparseable."""
+    if not isinstance(stamp, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+
+
+def _model_view(result: str) -> str:
+    """Drop the internal as_of stamp before the model sees a tool result."""
+    parsed = _as_account_result(result)
+    if parsed is None or "as_of" not in parsed:
+        return result
+    parsed.pop("as_of")
+    return json.dumps(parsed, ensure_ascii=False)
+
+
+def _sanitize_account_results(messages: list[dict]) -> list[dict]:
+    """Expire get_account_status results that are being replayed from history.
+
+    The freshness gate lives inside _account_status_for, so it only fires when
+    the model actually CALLS the tool. Tool results persist verbatim and are
+    replayed on every later turn, so Monday's "is_premium: true" would still be
+    sitting in context on Friday — the model can answer from it without calling
+    the tool, and the gate never runs. Results written before the gate existed
+    are worse: they carry instructions to answer from the cached snapshot.
+
+    Anything older than ACCOUNT_FRESHNESS_HOURS (or unstamped, i.e. pre-gate)
+    is replaced by a marker that sends the model back to the tool; the rest
+    just lose the internal stamp, so the model's view is unchanged.
+    """
+    out: list[dict] = []
+    for m in messages:
+        parsed = _as_account_result(m.get("content")) if m.get("role") == "tool" else None
+        if parsed is None:
+            out.append(m)
+            continue
+        age = _hours_since_stamp(parsed.get("as_of"))
+        if age is None or age > ACCOUNT_FRESHNESS_HOURS:
+            out.append({**m, "content": _ACCOUNT_RESULT_EXPIRED})
+        else:
+            parsed.pop("as_of", None)
+            out.append({**m, "content": json.dumps(parsed, ensure_ascii=False)})
+    return out
 
 
 try:
@@ -763,7 +887,9 @@ def _submit_ticket_for(phone: str, args: dict) -> str:
     """Handle the submit_support_ticket tool call. Returns the JSON tool result.
 
     Routing: a conversation linked to a site account (users.external_id exists —
-    any age; ACCOUNT_FRESHNESS_HOURS only flags get_account_status) files the
+    any age; ACCOUNT_FRESHNESS_HOURS only gates get_account_status, since the
+    account identity does not go stale and a re-login wall before filing a
+    complaint would only hurt) files the
     ticket ON the account via the admin API. An unlinked conversation gets a
     login gate first: the tool files nothing and returns login_required with a
     login_url, so the customer can log in and the ticket lands on their account
@@ -803,12 +929,11 @@ def _submit_ticket_for(phone: str, args: dict) -> str:
         login_url = _login_url_for(phone)
         instructions = (
             "הפנייה עוד לא נפתחה. הלקוח לא מחובר לחשבון אתר, ופנייה שנפתחת על "
-            "החשבון מזהה אותו לצוות אוטומטית. בקש/י ממנו להתחבר קודם, ושלח/י לו "
-            "את הערך של השדה login_url (כתובת ה-URL המלאה) כקישור לחיץ - אל "
-            "תכתוב/י את המילה 'login_url' או סוגריים. אחרי שהתחבר, קרא/י לכלי "
-            "שוב והפנייה תיפתח על החשבון. רק אם הלקוח אומר שאין לו חשבון, או "
-            "שניסה ולא הצליח להתחבר - קרא/י לכלי שוב עם no_account=true "
-            "והפנייה תיפתח אנונימית."
+            "החשבון מזהה אותו לצוות אוטומטית. בקש/י ממנו להתחבר קודם, "
+            + _SEND_LOGIN_LINK
+            + " אחרי שהתחבר, קרא/י לכלי שוב והפנייה תיפתח על החשבון. רק אם "
+            "הלקוח אומר שאין לו חשבון, או שניסה ולא הצליח להתחבר - קרא/י לכלי "
+            "שוב עם no_account=true והפנייה תיפתח אנונימית."
         )
         return json.dumps(
             {
@@ -870,7 +995,10 @@ def _submit_ticket_for(phone: str, args: dict) -> str:
             "בקצרה שהפנייה נשלחה ושנציג אנושי יחזור אליו "
             "בשעות הפעילות (א'-ה' 9:00-17:00). אל תמסור/י "
             "ללקוח מספר פנייה או מזהה - זה פרט פנימי, הצוות "
-            "מזהה את הפנייה לבד. אל תבטיח/י זמן מדויק מעבר לזה."
+            "מזהה את הפנייה לבד. אל תבטיח/י זמן מדויק מעבר לזה. "
+            "חריג: אם המאגר קובע נוסח קבוע לאישור של התרחיש הזה - "
+            "שלח/י אותו כלשונו במקום הנוסח הכללי, גם אם אינו מזכיר "
+            "שעות פעילות (אז אל תוסיף/י אותן מיוזמתך)."
         )
         if on_account:
             instructions += (
@@ -980,6 +1108,9 @@ def _prepare_messages(
             ],
         }
     messages = repair_tool_calls(messages)
+    # Account snapshots replayed from earlier turns carry no timestamp of their
+    # own; expire the ones the freshness gate would refuse to serve today.
+    messages = _sanitize_account_results(messages)
 
     # Surface any recently-filed support ticket as context. Inserted right after
     # the cached system prompt (index 0) so the static prefix still caches; this
@@ -1135,9 +1266,6 @@ def _run_rounds(
                                     escalate_requested = True
                                     parsed["escalated"] = True
                                     result = json.dumps(parsed, ensure_ascii=False)
-                                    # A filed ticket must not get a stray login
-                                    # link appended by the safety net.
-                                    pending_login_url = None
                             except (json.JSONDecodeError, AttributeError):
                                 pass
                         else:
@@ -1163,8 +1291,13 @@ def _run_rounds(
                             )
                         else:
                             result = f"שגיאה זמנית בהפעלת הכלי {name}. המשך/י לעזור ללקוח בלי המידע הזה."
+                    # The DB row keeps the as_of stamp (a later turn needs it to
+                    # tell a live snapshot from an expired one); the model sees
+                    # the same result without it.
                     db.append_message(phone, "tool", tool_call_id=tc.id, content=result)
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": _model_view(result)}
+                    )
                 continue
 
             # Final round — no tool calls. Flush the buffered answer downstream
@@ -1180,7 +1313,12 @@ def _run_rounds(
             # customer always gets a clickable link. Gated on login wording so a
             # deliberate diagnostic question (e.g. the "לא מצליח להתחבר" flow, where
             # the KB forbids auto-sending a link) is never force-fed a URL.
-            if pending_login_url and pending_login_url not in text:
+            # `not ticket_filed`: a filed ticket must not get a stray login link
+            # appended. Gated here rather than by clearing pending_login_url at
+            # submit time, so the invariant holds whatever order the model
+            # called the tools in (a stale account check AFTER the ticket used
+            # to re-arm the link).
+            if pending_login_url and not ticket_filed and pending_login_url not in text:
                 mentions_login = any(
                     k in text for k in ("התחבר", "תחבר", "קישור", "לינק", "sign-in")
                 )
@@ -1328,6 +1466,9 @@ def _post_login_reply(phone: str) -> str:
             return ""
     except (json.JSONDecodeError, AttributeError):
         return ""
+    # Embedded in a system note below, so strip the internal stamp the same way
+    # a tool result would be.
+    status_json = _model_view(status_json)
 
     last_at = db.last_message_at(phone)
     idle_hours = (

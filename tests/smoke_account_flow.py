@@ -24,6 +24,8 @@ os.environ["AUTH_CALLBACK_SECRET"] = "smoke-secret"
 os.environ["INTERNAL_API_SECRET"] = "smoke-internal"
 os.environ["WHATSAPP_API_URL"] = ""  # notifier must no-op, not call anything real
 os.environ["LOGIN_URL_BASE"] = "https://qa.sugardaddy.co.il/sign-in"
+# Pinned so a local/CI .env value can't fail the freshness assertions below.
+os.environ["ACCOUNT_FRESHNESS_HOURS"] = "48"
 
 from sugarbot import db  # noqa: E402
 
@@ -81,8 +83,8 @@ st = json.loads(server._account_status_for(phone))
 assert st["is_premium"] is False and st["labels"] == [{"id": "l3", "name": "expired"}], st
 print("5. re-login upsert -> status/labels updated")
 
-# 6) Stale login (>ACCOUNT_FRESHNESS_HOURS since last login) -> still answers
-#    from the cached data, but flagged stale + a login_url to refresh.
+# 6) Stale login (>ACCOUNT_FRESHNESS_HOURS since last login) -> the cached data
+#    is withheld; the tool returns a re-login gate (stale=true + login_url).
 import datetime as _dt  # noqa: E402
 
 assert server.ACCOUNT_FRESHNESS_HOURS == 48, server.ACCOUNT_FRESHNESS_HOURS
@@ -94,18 +96,52 @@ with db._engine.begin() as conn:
         .values(updated_at=stale_ts)
     )
 st = json.loads(server._account_status_for(phone))
-assert st["logged_in"] is True and st.get("stale") is True, st
-assert st["is_premium"] is False and st["labels"] == [{"id": "l3", "name": "expired"}], st
-assert st["nickname"] == "דני", st
+assert st["logged_in"] is False and st.get("stale") is True, st
+for withheld in ("nickname", "is_premium", "gender", "labels"):
+    assert withheld not in st, (withheld, st)
 assert st["hours_since_login"] >= server.ACCOUNT_FRESHNESS_HOURS, st
 assert st["login_url"].startswith("https://qa.sugardaddy.co.il/sign-in?phoneNumber="), st
-assert "לא עדכני" in st["instructions"] and "login_url" in st["instructions"], st
-# Fresh login -> no stale fields at all (the model must not see a caveat).
+assert "להתחבר שוב" in st["instructions"] and "login_url" in st["instructions"], st
+# The gate must not wall off ticket filing — the model is told tickets still work.
+assert "submit_support_ticket" in st["instructions"], st
+# Fresh login -> full data again, no stale fields (the model must not see a caveat).
 r = client.post("/auth/callback", json=payload, headers={"X-Webhook-Secret": "smoke-secret"})
 assert r.status_code == 204
 st = json.loads(server._account_status_for(phone))
 assert st["logged_in"] is True and "stale" not in st and "login_url" not in st, st
-print("6. stale login (>48h) -> logged_in=true + stale=true + data + login_url; fresh -> no caveat")
+assert "nickname" in st and "labels" in st, st
+print("6. stale login (>48h) -> data withheld + re-login gate; fresh -> full data, no caveat")
+
+# 6b) A snapshot replayed from an earlier turn must not outlive the gate: the
+#     model sees no as_of stamp, and a result older than the window (or one
+#     written before the gate existed) is replaced by an expired marker.
+live = server._account_status_for(phone)
+assert "as_of" in json.loads(live), "the persisted row needs a stamp to age against"
+assert "as_of" not in json.loads(server._model_view(live)), "as_of must not reach the model"
+
+def _tool_row(content):
+    return {"role": "tool", "tool_call_id": "call_1", "content": content}
+
+kept = server._sanitize_account_results([_tool_row(live)])[0]["content"]
+assert json.loads(kept)["is_premium"] is False and "as_of" not in json.loads(kept), kept
+old_stamp = (
+    _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=server.ACCOUNT_FRESHNESS_HOURS + 1)
+).isoformat(timespec="seconds")
+aged = json.dumps({**json.loads(live), "as_of": old_stamp}, ensure_ascii=False)
+# Pre-gate shape: logged_in=true WITH the data, and instructions to answer from it.
+legacy = json.dumps(
+    {"logged_in": True, "stale": True, "is_premium": True, "instructions": "ענה/י על סמך הנתונים האלה"},
+    ensure_ascii=False,
+)
+for stale_content in (aged, legacy):
+    out = json.loads(server._sanitize_account_results([_tool_row(stale_content)])[0]["content"])
+    assert out.get("expired") is True, out
+    assert "is_premium" not in out and "get_account_status" in out["instructions"], out
+# Non-account tool results pass through untouched.
+ticket_row = json.dumps({"submitted": True, "on_account": True}, ensure_ascii=False)
+assert server._sanitize_account_results([_tool_row(ticket_row)])[0]["content"] == ticket_row
+assert server._sanitize_account_results([_tool_row("לא JSON")])[0]["content"] == "לא JSON"
+print("6b. replayed snapshots: live one kept (no as_of), aged + pre-gate ones expired")
 
 # 7) /user/delete erases history + login row + conversation state.
 db.append_message(phone, "user", content="היי")

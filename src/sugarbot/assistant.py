@@ -37,10 +37,24 @@ MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 # while gpt-5 rejects "none" — so it must travel with the model in deploy
 # env, never be hardcoded. Unset/empty -> the parameter is omitted.
 REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "").strip()
+# How long cached login data counts as current. Past this, get_account_status
+# withholds the cached snapshot (premium/labels can change on the site, so an
+# old snapshot risks a confidently wrong answer) and returns a re-login gate
+# instead: the bot asks the customer to sign in again, the callback refreshes
+# the row, and the next call serves current data. Lives here, not in server.py,
+# because the prompt below states the threshold to the customer — a hardcoded
+# "48" there would contradict the tool on any non-default deployment.
+ACCOUNT_FRESHNESS_HOURS = int(os.getenv("ACCOUNT_FRESHNESS_HOURS", "48"))
 # Behaviour instructions + the KB index. Both are static, so the whole system
 # prompt stays the cacheable prefix; the model reads topic files on demand via
 # the read_kb tool instead of carrying the full knowledge base every turn.
-SYSTEM_PROMPT = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8") + "\n\n" + kb.build_index()
+SYSTEM_PROMPT = (
+    SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").replace(
+        "{{ACCOUNT_FRESHNESS_HOURS}}", str(ACCOUNT_FRESHNESS_HOURS)
+    )
+    + "\n\n"
+    + kb.build_index()
+)
 
 # Picks up OPENAI_API_KEY from env. Explicit per-request timeout: the SDK
 # default is 600s, and with the sync streaming loop each hung request pins a

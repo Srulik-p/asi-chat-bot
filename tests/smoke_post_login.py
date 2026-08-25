@@ -197,9 +197,12 @@ assert note["role"] == "system", note["role"]
 roles = [m["role"] for m in sent_messages]
 assert roles[1:3] == ["user", "assistant"], roles
 # ...and it carries the freshly refreshed account status, verbatim.
-status = json.loads(server._account_status_for(phone2))
+status_json = server._model_view(server._account_status_for(phone2))
+status = json.loads(status_json)
 assert status["logged_in"] is True and status["is_premium"] is True, status
-assert json.dumps(status, ensure_ascii=False) in note["content"], note["content"]
+assert status_json in note["content"], note["content"]
+# The internal freshness stamp is for replay ageing only — never for the model.
+assert "as_of" not in note["content"], note["content"]
 assert "get_account_status" in note["content"], note["content"]
 # ...and the two rules that make this message different from the old greeting.
 assert "אל תסתפק/י ב'אני רואה שהתחברת'" in note["content"], note["content"]
