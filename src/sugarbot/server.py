@@ -440,7 +440,9 @@ CONTACT_TOOLS = [
                 "and could not log in, call again with no_account=true to file "
                 "anonymously. After a successful submit, tell the "
                 "customer a human representative will get back to them during "
-                "working hours. Never give the customer a ticket number or id."
+                "working hours — unless the knowledge base defines a fixed "
+                "confirmation for that scenario (see above), which replaces this "
+                "wording. Never give the customer a ticket number or id."
             ),
             "parameters": {
                 "type": "object",
@@ -487,9 +489,12 @@ CONTACT_TOOLS = [
 TOOLS_ALL = TOOLS + ACCOUNT_TOOLS + CONTACT_TOOLS
 
 
-def _hours_since_login(user: dict) -> float | None:
-    """Hours since the cached login row was last refreshed; None if undatable."""
-    raw = user.get("updated_at")
+def _as_utc(raw) -> datetime | None:
+    """Coerce a DB timestamp or ISO-8601 string to an aware UTC datetime.
+
+    Shared by the login-age gate and the replay stamp so both read a row the
+    same way whatever the driver hands back.
+    """
     if isinstance(raw, datetime):
         dt = raw
     elif isinstance(raw, str):
@@ -501,7 +506,18 @@ def _hours_since_login(user: dict) -> float | None:
         return None
     if dt.tzinfo is None:  # SQLite hands back naive datetimes; they are UTC.
         dt = dt.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+    return dt
+
+
+def _hours_since(raw) -> float | None:
+    """Hours elapsed since a timestamp; None when missing or unparseable."""
+    dt = _as_utc(raw)
+    return None if dt is None else (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+
+
+def _hours_since_login(user: dict) -> float | None:
+    """Hours since the cached login row was last refreshed; None if undatable."""
+    return _hours_since(user.get("updated_at"))
 
 
 def _login_is_stale(user: dict) -> bool:
@@ -526,15 +542,22 @@ _SEND_LOGIN_LINK = (
 )
 
 
-def _stamped(payload: dict) -> str:
-    """Serialize an account-status payload with an internal retrieval stamp.
+def _stamped(payload: dict, as_of: datetime | None = None) -> str:
+    """Serialize an account-status payload with the time its data is AS OF.
 
-    `as_of` never reaches the model (_model_view strips it on the way out) — it
+    For a served snapshot that is the customer's last login (users.updated_at),
+    NOT the moment the tool ran — _login_is_stale measures the login, so ageing
+    a replayed copy from retrieval time would keep it alive for up to twice the
+    window (fetch at login+47h, still "fresh" 47h later). Payloads that carry no
+    account data have no login to age against and fall back to now().
+
+    `as_of` never reaches the model (_model_view strips it on the way out); it
     exists so the same row, replayed from history on a later turn, can be
     recognised as expired instead of answered from. See _sanitize_account_results.
     """
+    stamp = _as_utc(as_of) or datetime.now(timezone.utc)
     return json.dumps(
-        {**payload, "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds")},
+        {**payload, "as_of": stamp.isoformat(timespec="seconds")},
         ensure_ascii=False,
     )
 
@@ -550,11 +573,15 @@ def _not_logged_in(phone: str) -> str:
 
 
 def _ago_phrase(hours: float) -> str:
-    """Hebrew 'about N days/hours' for an elapsed span."""
+    """Hebrew 'about N days/hours' for an elapsed span.
+
+    Hours round UP: this phrase sits next to "more than N hours" in the stale
+    gate, and a floored 24.5 would read "about 24 hours - more than 24 hours".
+    """
     days = int(hours // 24)
     if days >= 2:
         return f"כ-{days} ימים"
-    return f"כ-{int(hours)} שעות"
+    return f"כ-{math.ceil(hours)} שעות"
 
 
 def _stale_note(age_hours: float | None) -> str:
@@ -618,7 +645,10 @@ def _account_status_for(phone: str) -> str:
             # gender-neutral phrasing when absent.
             "gender": user.get("gender"),
             "labels": user["labels"],
-        }
+        },
+        # Age a replayed copy from the login it describes, exactly as the live
+        # gate does — not from the moment this call happened to run.
+        as_of=user.get("updated_at"),
     )
 
 
@@ -647,19 +677,6 @@ def _as_account_result(content) -> dict | None:
     # submit_support_ticket results carry submitted/login_required, never
     # logged_in, so they pass through untouched.
     return parsed if isinstance(parsed, dict) and "logged_in" in parsed else None
-
-
-def _hours_since_stamp(stamp) -> float | None:
-    """Hours since an ISO-8601 stamp; None when missing or unparseable."""
-    if not isinstance(stamp, str):
-        return None
-    try:
-        dt = datetime.fromisoformat(stamp)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
 
 
 def _model_view(result: str) -> str:
@@ -691,7 +708,7 @@ def _sanitize_account_results(messages: list[dict]) -> list[dict]:
         if parsed is None:
             out.append(m)
             continue
-        age = _hours_since_stamp(parsed.get("as_of"))
+        age = _hours_since(parsed.get("as_of"))
         if age is None or age > ACCOUNT_FRESHNESS_HOURS:
             out.append({**m, "content": _ACCOUNT_RESULT_EXPIRED})
         else:
@@ -1313,12 +1330,18 @@ def _run_rounds(
             # customer always gets a clickable link. Gated on login wording so a
             # deliberate diagnostic question (e.g. the "לא מצליח להתחבר" flow, where
             # the KB forbids auto-sending a link) is never force-fed a URL.
-            # `not ticket_filed`: a filed ticket must not get a stray login link
-            # appended. Gated here rather than by clearing pending_login_url at
-            # submit time, so the invariant holds whatever order the model
-            # called the tools in (a stale account check AFTER the ticket used
-            # to re-arm the link).
-            if pending_login_url and not ticket_filed and pending_login_url not in text:
+            # A filed ticket must not get a stray login link appended — the
+            # stale gate tells the customer no re-login is needed for a ticket,
+            # so a URL under that sentence contradicts it. Gated here rather
+            # than by clearing pending_login_url at submit time, so the
+            # invariant holds whatever order the model called the tools in.
+            # `ticket_gated` re-opens it: there, a submit_support_ticket call
+            # refused to file WITHOUT a login, so the customer does need the link.
+            if (
+                pending_login_url
+                and (not ticket_filed or ticket_gated)
+                and pending_login_url not in text
+            ):
                 mentions_login = any(
                     k in text for k in ("התחבר", "תחבר", "קישור", "לינק", "sign-in")
                 )

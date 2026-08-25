@@ -143,6 +143,37 @@ assert server._sanitize_account_results([_tool_row(ticket_row)])[0]["content"] =
 assert server._sanitize_account_results([_tool_row("לא JSON")])[0]["content"] == "לא JSON"
 print("6b. replayed snapshots: live one kept (no as_of), aged + pre-gate ones expired")
 
+# 6c) The stamp must track the LOGIN it describes, not the moment the tool ran —
+#     otherwise a snapshot fetched just under the window survives replay for
+#     another full window (up to 2x the freshness the gate promises).
+near_ts = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(
+    hours=server.ACCOUNT_FRESHNESS_HOURS - 1
+)
+with db._engine.begin() as conn:
+    conn.execute(
+        db.users_table.update()
+        .where(db.users_table.c.phone_number == phone)
+        .values(updated_at=near_ts)
+    )
+near_json = server._account_status_for(phone)
+near = json.loads(near_json)
+assert near["logged_in"] is True, near
+stamp = _dt.datetime.fromisoformat(near["as_of"])
+if stamp.tzinfo is None:
+    stamp = stamp.replace(tzinfo=_dt.timezone.utc)
+assert abs((stamp - near_ts).total_seconds()) < 5, (near["as_of"], near_ts.isoformat())
+age_at_stamp = (_dt.datetime.now(_dt.timezone.utc) - stamp).total_seconds() / 3600
+assert age_at_stamp > server.ACCOUNT_FRESHNESS_HOURS - 2, ("as_of tracks the tool call", near["as_of"])
+# Inside the window it still replays; two more hours of login age and it must not.
+kept_near = json.loads(server._sanitize_account_results([_tool_row(near_json)])[0]["content"])
+assert kept_near.get("expired") is not True and kept_near["logged_in"] is True, kept_near
+past = json.dumps(
+    {**near, "as_of": (near_ts - _dt.timedelta(hours=2)).isoformat(timespec="seconds")},
+    ensure_ascii=False,
+)
+assert json.loads(server._sanitize_account_results([_tool_row(past)])[0]["content"])["expired"] is True
+print("6c. as_of tracks the login, so replay expires on the same clock as the gate")
+
 # 7) /user/delete erases history + login row + conversation state.
 db.append_message(phone, "user", content="היי")
 db.append_message(phone, "assistant", content="שלום")
