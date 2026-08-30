@@ -364,8 +364,8 @@ ACCOUNT_TOOLS = [
                 f"A last login older than {ACCOUNT_FRESHNESS_HOURS} hours counts "
                 "as NOT logged in: the cached details are withheld (stale: true) "
                 "because they may have changed since — ask the customer to sign "
-                "in again to refresh them (filing a support ticket still works "
-                "without re-login). "
+                "in again to refresh them. The same window applies before filing "
+                "a support ticket. "
                 "It does NOT return subscription dates — never invent an end/renewal "
                 "date. Use gender to tailor the answer (women have free access — "
                 "never tell a woman she is not premium). Takes no arguments — the "
@@ -436,9 +436,13 @@ CONTACT_TOOLS = [
                 "account yet, the tool files nothing and returns login_required=true "
                 "with a login_url: ask the customer to log in via that link first "
                 "(so the ticket lands on their account), then call again after they "
-                "logged in. Only if the customer says they have no account, or tried "
-                "and could not log in, call again with no_account=true to file "
-                "anonymously. After a successful submit, tell the "
+                "logged in. The same gate fires with stale=true when the account IS "
+                f"linked but the last login is older than {ACCOUNT_FRESHNESS_HOURS} "
+                "hours — ask them to sign in again, then call again. Only if the "
+                "customer says they have no account, or tried and could not log in, "
+                "or the matter is too urgent to delay, call again with "
+                "no_account=true (on a stale account that still files ON the "
+                "account, not anonymously). After a successful submit, tell the "
                 "customer a human representative will get back to them during "
                 "working hours — unless the knowledge base defines a fixed "
                 "confirmation for that scenario (see above), which replaces this "
@@ -473,9 +477,12 @@ CONTACT_TOOLS = [
                         "type": "boolean",
                         "description": (
                             "Set true ONLY after the customer said they have no "
-                            "site account, or tried to log in and could not — "
-                            "files the ticket anonymously (guest). Never set it "
-                            "on your own initiative to skip the login step."
+                            "site account, or tried to log in and could not, or "
+                            "the matter is too urgent to delay behind a sign-in "
+                            "(a serious report, distress) — files the ticket "
+                            "anonymously (guest), or ON the account when one is "
+                            "linked but the login went stale. Never set it on "
+                            "your own initiative to skip the login step."
                         ),
                     },
                 },
@@ -620,9 +627,11 @@ def _account_status_for(phone: str) -> str:
             "מנוי ותוויות יכולים להשתנות. אל תענה/י על שאלות חשבון מנתונים "
             "ישנים ואל תנחש/י. בקש/י מהלקוח להתחבר שוב כדי שהמידע יתעדכן, "
             + _SEND_LOGIN_LINK
-            + " אם הלקוח רוצה לפתוח פנייה לצוות או לדבר עם נציג - אין צורך "
-            "בהתחברות מחדש בשביל זה: קרא/י ל-submit_support_ticket כרגיל "
-            "והפנייה תיפתח על החשבון שלו."
+            + " גם פתיחת פנייה לצוות דורשת את ההתחברות הזו - submit_support_ticket "
+            "יחזיר את אותה בקשת התחברות עד שהלקוח יתחבר. אם הוא ניסה ולא הצליח, "
+            "או שהעניין דחוף מכדי לעכב - קרא/י ל-submit_support_ticket עם "
+            "no_account=true והפנייה תיפתח על החשבון שלו בכל זאת. העברה לנציג "
+            "(escalate_to_human) אינה דורשת התחברות בכלל."
         )
         return _stamped(
             {
@@ -903,15 +912,19 @@ def _open_ticket_note(phone: str) -> str | None:
 def _submit_ticket_for(phone: str, args: dict) -> str:
     """Handle the submit_support_ticket tool call. Returns the JSON tool result.
 
-    Routing: a conversation linked to a site account (users.external_id exists —
-    any age; ACCOUNT_FRESHNESS_HOURS only gates get_account_status, since the
-    account identity does not go stale and a re-login wall before filing a
-    complaint would only hurt) files the
-    ticket ON the account via the admin API. An unlinked conversation gets a
-    login gate first: the tool files nothing and returns login_required with a
-    login_url, so the customer can log in and the ticket lands on their account
-    (with their userId). Only an explicit no_account=true from the model — the
+    Routing: a conversation linked to a site account (users.external_id exists,
+    and the cached login is within ACCOUNT_FRESHNESS_HOURS) files the ticket ON
+    the account via the admin API. An unlinked conversation gets a login gate
+    first: the tool files nothing and returns login_required with a login_url,
+    so the customer can log in and the ticket lands on their account (with
+    their userId). A linked-but-STALE conversation gets the same gate with
+    stale=true — the same window get_account_status enforces, so the whole bot
+    works off a login the customer refreshed within the window rather than a
+    months-old one. Only an explicit no_account=true from the model — the
     customer said they have no account or could not log in — files anonymously.
+    On a stale row that flag does NOT go anonymous: the account is still linked,
+    so the ticket is filed ON it (a customer who cannot sign in again must never
+    end up worse off than one who never signed in).
     Anonymous tickets go through the same admin endpoint, just without a
     userId; the unauth contact-form endpoint remains the fallback (admin
     unconfigured or failing) so the customer always ends up with a ticket. The
@@ -929,10 +942,16 @@ def _submit_ticket_for(phone: str, args: dict) -> str:
     no_account = bool(no_account)
 
     external_id = None
+    stale_login = False
+    stale_age = None
     lookup_failed = False
     try:
         user = db.get_user_by_phone(phone)
         external_id = (user or {}).get("external_id") or None
+        # Same window get_account_status gates on. `external_id is not None`
+        # short-circuits the None row, so _login_is_stale always gets a dict.
+        stale_login = external_id is not None and _login_is_stale(user)
+        stale_age = _hours_since_login(user) if stale_login else None
     except Exception as e:
         # A DB hiccup must not block filing anonymously (and the login gate
         # below would be pointless — the callback row could not be read anyway).
@@ -957,6 +976,33 @@ def _submit_ticket_for(phone: str, args: dict) -> str:
                 "submitted": False,
                 "login_required": True,
                 "login_url": login_url,
+                "instructions": instructions,
+            },
+            ensure_ascii=False,
+        )
+
+    if stale_login and not no_account:
+        instructions = (
+            f"הפנייה עוד לא נפתחה. {_stale_note(stale_age)}, ולכן צריך התחברות "
+            "מחדש לפני פתיחת הפנייה - כדי שהפנייה תיפתח על חשבון עם נתונים "
+            "עדכניים. בקש/י מהלקוח בחום להתחבר שוב, "
+            + _SEND_LOGIN_LINK
+            + " אחרי שהתחבר, קרא/י לכלי שוב והפנייה תיפתח על החשבון. אם ניסה "
+            "ולא הצליח להתחבר, או שהעניין דחוף מכדי לעכב (למשל דיווח חמור או "
+            "מצוקה) - קרא/י לכלי שוב עם no_account=true: החשבון עדיין מקושר "
+            "לשיחה, אז הפנייה תיפתח עליו בכל זאת ולא אנונימית."
+        )
+        return json.dumps(
+            {
+                "submitted": False,
+                "login_required": True,
+                "stale": True,
+                # Ceil for the same reason the account gate does: the number
+                # sits next to its own "more than N hours" claim.
+                "hours_since_login": (
+                    math.ceil(stale_age) if stale_age is not None else None
+                ),
+                "login_url": _login_url_for(phone),
                 "instructions": instructions,
             },
             ensure_ascii=False,

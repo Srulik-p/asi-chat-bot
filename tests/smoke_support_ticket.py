@@ -922,29 +922,49 @@ assert len(_calls) == 1 and _calls[0]["url"] == "https://admin.example/support",
 assert _calls[0]["json"]["userId"] == "site-uuid-9", _calls[0]["json"]
 rows = db.recent_support_tickets(phone2)
 assert rows and rows[0]["ticket_id"] == "ADM-2", rows
-# A STALE login (older than ACCOUNT_FRESHNESS_HOURS) must still file ON the
-# account: the freshness gate covers get_account_status only, and the gate's own
-# instructions promise the customer no re-login is needed to reach a rep.
+# A STALE login (older than ACCOUNT_FRESHNESS_HOURS) gates ticket filing the
+# same way it gates get_account_status: nothing is filed until the customer
+# signs in again, so the ticket lands on an account whose details are current.
 import datetime as _dt  # noqa: E402
 
-_stale_ts = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(
-    hours=server.ACCOUNT_FRESHNESS_HOURS + 1
-)
-with db._engine.begin() as _conn:
-    _conn.execute(
-        db.users_table.update()
-        .where(db.users_table.c.phone_number == phone2)
-        .values(updated_at=_stale_ts)
-    )
+
+def _set_login_age(hours: float) -> None:
+    ts = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours)
+    with db._engine.begin() as _conn:
+        _conn.execute(
+            db.users_table.update()
+            .where(db.users_table.c.phone_number == phone2)
+            .values(updated_at=ts)
+        )
+
+
+_set_login_age(server.ACCOUNT_FRESHNESS_HOURS + 1)
 assert _json.loads(server._account_status_for(phone2))["logged_in"] is False, "row should read stale"
 _calls.clear()
 _next_body = {"id": "ADM-2S", "status": "None"}
 result = server._submit_ticket_for(phone2, {"reason": "report", "text": "דיווח על משתמש"})
 parsed = _json.loads(result)
+assert parsed["submitted"] is False, parsed
+assert parsed.get("login_required") is True and parsed.get("stale") is True, parsed
+assert parsed["login_url"].startswith(server.LOGIN_URL_BASE), parsed
+assert parsed["hours_since_login"] >= server.ACCOUNT_FRESHNESS_HOURS, parsed
+assert _calls == [], "a stale login must file nothing before the customer signs in again"
+assert db.recent_support_tickets(phone2)[0]["ticket_id"] == "ADM-2", "nothing persisted on the gate"
+print("11s. stale linked row (>freshness window) gates filing: login_required + stale")
+# ...but the escape hatch never strands a customer who cannot sign in again (or
+# a report too urgent to delay): no_account=true on a LINKED row still files ON
+# the account, never anonymously.
+_calls.clear()
+_next_body = {"id": "ADM-2S", "status": "None"}
+result = server._submit_ticket_for(
+    phone2, {"reason": "report", "text": "דיווח על משתמש", "no_account": True}
+)
+parsed = _json.loads(result)
 assert parsed["submitted"] is True and parsed["on_account"] is True, parsed
-assert parsed.get("login_required") is None, "a stale login must not gate ticket filing"
 assert len(_calls) == 1 and _calls[0]["json"]["userId"] == "site-uuid-9", _calls
-print("11s. stale linked row (>freshness window) still files ON the account, no login gate")
+print("11t. stale + no_account=true files ON the account (not anonymously)")
+# Restore a fresh login so the ungated cases below exercise the normal path.
+_set_login_age(0)
 _calls.clear()
 _next_body = {"id": "TKT-3003", "status": "open"}
 # anonymous conversation WITHOUT no_account -> no ticket yet: ask to log in first
