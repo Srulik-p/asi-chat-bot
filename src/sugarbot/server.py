@@ -106,6 +106,9 @@ INTERNAL_SECRET = os.getenv("INTERNAL_API_SECRET", "")
 # True on Cloud Run (K_SERVICE is injected by the platform). Used to fail fast
 # on misconfiguration that local dev tolerates.
 _ON_CLOUD_RUN = bool(os.getenv("K_SERVICE"))
+# Stamped at import so log lines can carry the process uptime: a slow login
+# callback with a tiny uptime_secs was paying for a cold start, not for work.
+_PROCESS_T0 = time.monotonic()
 # Base of the external sign-in URL; the user's phone is appended as a query arg.
 # The QA default is for LOCAL DEV ONLY — lifespan refuses to start on Cloud Run
 # without an explicit value, so a prod deploy can never silently hand customers
@@ -163,6 +166,9 @@ async def lifespan(_app: FastAPI):
         )
     anyio.to_thread.current_default_thread_limiter().total_tokens = SERVER_THREADPOOL_SIZE
     db.init_db()
+    # One line per instance start: import->ready is the app's share of a cold
+    # start (the Cloud Run request log holds the rest).
+    print(f"[boot] ready secs={time.monotonic() - _PROCESS_T0:.2f}", file=sys.stderr)
     # Which public IP we leave from — the admin help desk whitelists by source
     # IP. In a daemon thread so a slow lookup can't eat into the startup
     # deadline; the log line is the only consumer.
@@ -290,6 +296,7 @@ def auth_callback(
     background_tasks: BackgroundTasks,
     x_webhook_secret: Annotated[str | None, Header(alias="X-Webhook-Secret")] = None,
 ) -> None:
+    t0 = time.monotonic()
     _check_secret(x_webhook_secret, WEBHOOK_SECRET, "AUTH_CALLBACK_SECRET")
     # payload.accessToken is accepted (site contract) but deliberately NOT
     # persisted — a plaintext live session token per customer is breach
@@ -302,11 +309,23 @@ def auth_callback(
         gender=payload.user.gender,
         labels=[l.model_dump() for l in payload.user.labels],
     )
+    # uptime_secs answers "was this the instance's first request?": a slow
+    # callback + uptime of a few seconds means the site waited on a cold start,
+    # not on the handler. upsert_secs is everything the 204 waits for.
+    print(
+        f"[auth] callback phone={payload.phoneNumber} "
+        f"upsert_secs={time.monotonic() - t0:.2f} "
+        f"uptime_secs={time.monotonic() - _PROCESS_T0:.2f}",
+        file=sys.stderr,
+    )
     # Push the post-login message out-of-band so the callback returns 204 fast
     # and the (best-effort) send can't block or fail the auth flow. _notify_login
     # lives further down, next to the chat machinery it replays the conversation
-    # through (see "post-login continuation").
-    background_tasks.add_task(_notify_login, payload.phoneNumber, payload.user.nickname)
+    # through (see "post-login continuation"). The enqueue stamp lets it report
+    # how long the task sat in the pool before starting (queue_secs).
+    background_tasks.add_task(
+        _notify_login, payload.phoneNumber, payload.user.nickname, time.monotonic()
+    )
 
 
 # ---------- /chat ----------
@@ -1560,7 +1579,7 @@ def _post_login_reply(phone: str) -> str:
     return (reply_out[0] if reply_out else "").strip()
 
 
-def _notify_login(phone: str, nickname: str | None) -> None:
+def _notify_login(phone: str, nickname: str | None, enqueued_at: float | None = None) -> None:
     """Push the post-login message and, on success, record it in the history.
 
     Holds the per-phone lock across the whole generation: the rows the model
@@ -1568,9 +1587,15 @@ def _notify_login(phone: str, nickname: str | None) -> None:
     (that poisons every later replay), and a customer message arriving
     meanwhile should wait and then see this reply in its history. Recording
     only after a successful send keeps the log honest about what the customer
-    actually received."""
+    actually received.
+
+    `enqueued_at` (time.monotonic() at the callback) feeds queue_secs in the
+    push log — with lock_wait/gen/send it attributes the customer-perceived
+    login->message delay to threadpool backlog, an in-flight chat turn, the
+    model replay, or the outbound send."""
+    t_start = time.monotonic()
     with _phone_lock(phone):
-        t0 = time.monotonic()
+        t_locked = time.monotonic()
         try:
             text = _post_login_reply(phone)
         except Exception as e:
@@ -1583,15 +1608,23 @@ def _notify_login(phone: str, nickname: str | None) -> None:
             )
             traceback.print_exc()
             text = ""
+        t_generated = time.monotonic()
         generated = bool(text)
         if not text:
             text = _connected_message(nickname)
+        sent = notifier.send_message(phone, text)
+        t_sent = time.monotonic()
         print(
             f"[auth] post-login push phone={phone} generated={generated} "
-            f"secs={time.monotonic() - t0:.2f} chars={len(text)}",
+            f"sent={sent} "
+            f"queue_secs={t_start - enqueued_at if enqueued_at is not None else 0:.2f} "
+            f"lock_wait_secs={t_locked - t_start:.2f} "
+            f"gen_secs={t_generated - t_locked:.2f} "
+            f"send_secs={t_sent - t_generated:.2f} "
+            f"total_secs={t_sent - t_start:.2f} chars={len(text)}",
             file=sys.stderr,
         )
-        if notifier.send_message(phone, text):
+        if sent:
             db.append_message(phone, "assistant", content=text)
 
 

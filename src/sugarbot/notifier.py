@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import requests
 
@@ -82,6 +83,7 @@ def send_message(phone_number: str, message: str) -> bool:
         "Content-Type": "application/json",
     }
 
+    t0 = time.monotonic()
     try:
         resp = requests.post(
             f"{WHATSAPP_API_URL}/api/messages/send",
@@ -96,8 +98,11 @@ def send_message(phone_number: str, message: str) -> bool:
         body = getattr(getattr(e, "response", None), "text", "")
         if body:
             detail = f" body={body[:300]}"
+        # Duration matters here: a 10s timeout and an instant 401 read the same
+        # without it.
         print(
-            f"[notifier] outbound send failed: {type(e).__name__}: {e}{detail}",
+            f"[notifier] outbound send failed after {time.monotonic() - t0:.2f}s: "
+            f"{type(e).__name__}: {e}{detail}",
             file=sys.stderr,
         )
         return False

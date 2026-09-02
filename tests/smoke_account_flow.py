@@ -61,10 +61,29 @@ r = client.post("/auth/callback", json=payload, headers={"X-Webhook-Secret": "wr
 assert r.status_code == 401, r.status_code
 print("2. callback without/wrong secret -> 401")
 
-# 3) Callback with secret -> 204, user upserted
-r = client.post("/auth/callback", json=payload, headers={"X-Webhook-Secret": "smoke-secret"})
+# 3) Callback with secret -> 204, user upserted. Also assert the latency
+#    breakdown logs: one [auth] callback line (handler + upsert timing, with
+#    process uptime so a cold start is attributable) and one [auth] post-login
+#    push line splitting queue / lock wait / generation / send.
+import contextlib  # noqa: E402
+import io  # noqa: E402
+import re  # noqa: E402
+
+_stderr = io.StringIO()
+with contextlib.redirect_stderr(_stderr):
+    r = client.post("/auth/callback", json=payload, headers={"X-Webhook-Secret": "smoke-secret"})
 assert r.status_code == 204, (r.status_code, r.text)
-print("3. callback with secret -> 204")
+_log = _stderr.getvalue()
+assert re.search(
+    r"\[auth\] callback phone=\S+ upsert_secs=\d+\.\d+ uptime_secs=\d+\.\d+", _log
+), _log
+assert re.search(
+    r"\[auth\] post-login push phone=\S+ generated=(True|False) sent=(True|False) "
+    r"queue_secs=\d+\.\d+ lock_wait_secs=\d+\.\d+ gen_secs=\d+\.\d+ "
+    r"send_secs=\d+\.\d+ total_secs=\d+\.\d+ chars=\d+",
+    _log,
+), _log
+print("3. callback with secret -> 204; [auth] callback + push timing logs present")
 
 # 4) Now in DB -> logged_in true with labels
 st = json.loads(server._account_status_for(phone))
