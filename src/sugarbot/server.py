@@ -19,7 +19,10 @@ POST /chat/message
                                                        ref correlates to the log line)
     Persists the user turn, runs the OpenAI tool-call loop (including read_kb),
     persists every assistant/tool turn, and streams the final reply. Turns are
-    serialized per phone number.
+    serialized per phone number and debounced: a burst of messages gets ONE
+    reply, on the newest message's request, once the phone has been quiet for
+    CHAT_DEBOUNCE_SECONDS; the earlier requests return `done` with no delta
+    (send nothing for those).
 
 GET  /chat/history?phoneNumber=...
     Headers: X-Internal-Secret
@@ -1138,6 +1141,20 @@ def _media_placeholder(media: list["MediaItem"]) -> str:
     return "".join(f"\n[המשתמש צירף {labels.get(m.type, 'קובץ')}]" for m in media)
 
 
+# Inbound burst batching: customers often split one thought across several
+# quick WhatsApp messages ("היי" / "יש לי שאלה" / "על החיוב"), and answering each
+# one separately floods them with replies. Every inbound message joins a
+# per-phone pending batch; only the request for the newest message answers, and
+# only once the conversation has been quiet for CHAT_DEBOUNCE_SECONDS — it then
+# answers the whole batch in one turn. In-process state, so it carries the same
+# single-instance assumption as _phone_lock.
+CHAT_DEBOUNCE_SECONDS = float(os.getenv("CHAT_DEBOUNCE_SECONDS", "3"))
+
+_PENDING: dict[str, list[tuple[str, list["MediaItem"]]]] = {}
+_INBOUND_SEQ: dict[str, int] = {}
+_PENDING_GUARD = threading.Lock()
+
+
 def _run_chat(
     phone: str, user_message: str, media: list["MediaItem"] | None = None
 ) -> Iterator[dict]:
@@ -1149,19 +1166,40 @@ def _run_chat(
     the model on THIS turn only; the stored history keeps a light text
     placeholder instead of the bytes.
 
-    Holds the per-phone lock for the whole turn: a WhatsApp double-send (or the
-    auth-callback push) must not interleave rows into this turn's tool round —
-    the second message waits and then sees the first turn's full history.
+    Debounced (see CHAT_DEBOUNCE_SECONDS): a request whose message was followed
+    by a newer one from the same phone yields only `done`, with no delta — its
+    message is answered by the newer request's reply.
+
+    Holds the per-phone lock for the whole turn: the auth-callback push or a
+    message arriving mid-turn must not interleave rows into this turn's tool
+    round — the later message waits and then sees the first turn's full history.
     """
-    with _phone_lock(phone):
-        yield from _run_chat_locked(phone, user_message, media)
+    with _PENDING_GUARD:
+        _PENDING.setdefault(phone, []).append((user_message, media or []))
+        seq = _INBOUND_SEQ[phone] = _INBOUND_SEQ.get(phone, 0) + 1
+    if CHAT_DEBOUNCE_SECONDS > 0:
+        time.sleep(CHAT_DEBOUNCE_SECONDS)
+    with _PENDING_GUARD:
+        superseded = _INBOUND_SEQ[phone] != seq
+    if not superseded:
+        with _phone_lock(phone):
+            # Re-checked under the lock: a message that arrived while an earlier
+            # turn held the lock makes this request superseded too. Check and
+            # pop are atomic, so whoever pops always takes its own message.
+            with _PENDING_GUARD:
+                superseded = _INBOUND_SEQ[phone] != seq
+                batch = [] if superseded else _PENDING.pop(phone, [])
+            if batch:
+                yield from _run_chat_locked(phone, batch)
+                return
+    print(f"[chat] debounced phone={phone} seq={seq}: merged into a newer message", file=sys.stderr)
+    yield {"type": "done", "usage": empty_usage()}
 
 
 def _prepare_messages(
     phone: str,
     history: list[dict],
-    user_message: str = "",
-    media: list["MediaItem"] | None = None,
+    batch: list[tuple[str, list["MediaItem"]]] | None = None,
 ) -> list[dict]:
     """Build the LLM-facing messages list for a conversation.
 
@@ -1172,23 +1210,28 @@ def _prepare_messages(
     repair_tool_calls drops the dangling half cleanly and a single poisoned
     turn can't 400 the conversation forever.
 
+    `batch` is this turn's inbound messages, (text, media) in arrival order —
+    they are the last rows of `history`.
+
     Shared by a chat turn and the post-login continuation, so both reason over
     exactly the same conversation.
     """
-    media = media or []
+    batch = batch or []
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
     messages = scrub_messages(messages)
-    # Attach this turn's media to the last (current) user message as multimodal
+    # Attach this turn's media to the user message it came with as multimodal
     # content, so the model actually sees the screenshot/receipt. Past turns keep
     # only their text placeholder (see _media_placeholder) to save tokens.
-    if media and messages and messages[-1].get("role") == "user":
-        messages[-1] = {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": redact_pii(user_message)},
-                *_media_content_parts(media),
-            ],
-        }
+    first = len(messages) - len(batch)
+    for idx, (text, media) in enumerate(batch, start=first):
+        if media and idx > 0 and messages[idx].get("role") == "user":
+            messages[idx] = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": redact_pii(text)},
+                    *_media_content_parts(media),
+                ],
+            }
     messages = repair_tool_calls(messages)
     # Account snapshots replayed from earlier turns carry no timestamp of their
     # own; expire the ones the freshness gate would refuse to serve today.
@@ -1204,17 +1247,19 @@ def _prepare_messages(
 
 
 def _run_chat_locked(
-    phone: str, user_message: str, media: list["MediaItem"] | None = None
+    phone: str, batch: list[tuple[str, list["MediaItem"]]]
 ) -> Iterator[dict]:
-    media = media or []
     # Store the raw text plus a placeholder note for any attachment. The bytes
     # themselves are attached to the live request below, not persisted.
-    db.append_message(phone, "user", content=user_message + _media_placeholder(media))
+    for text, media in batch:
+        db.append_message(phone, "user", content=text + _media_placeholder(media))
+    if len(batch) > 1:
+        print(f"[chat] batched phone={phone} messages={len(batch)}", file=sys.stderr)
     # Replay only the most recent window to the model (the full log stays in the
     # DB, and is only fetched that far — a months-old thread must not be shipped
     # over the wire every turn).
     history = db.load_history(phone, limit=HISTORY_MAX_MESSAGES)
-    yield from _run_rounds(phone, _prepare_messages(phone, history, user_message, media))
+    yield from _run_rounds(phone, _prepare_messages(phone, history, batch))
 
 
 def _run_rounds(

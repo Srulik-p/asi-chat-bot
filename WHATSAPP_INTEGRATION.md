@@ -36,6 +36,11 @@ Rules:
 
 - **Accumulate all `delta` texts and send them as ONE WhatsApp message.**
   WhatsApp has no streaming; the joined deltas are the full reply.
+- **`done` with no `delta` means "send nothing"** — not a failure. The bot
+  debounces bursts (`CHAT_DEBOUNCE_SECONDS`, default 3 s): when a customer
+  sends several messages in quick succession, only the request for the newest
+  one carries the reply, covering the whole burst; the earlier requests end
+  with an empty `done`. Every request takes at least the debounce window.
 - **`error.message` is already a customer-safe Hebrew string** — forward it to
   the user as-is. `ref` correlates to the server log line; keep it out of the
   user-facing message.
