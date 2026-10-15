@@ -184,7 +184,7 @@ assert len(rows) == 1 and rows[0]["ticket_id"] == "TKT-1001" and rows[0]["status
 from sugarbot import server  # noqa: E402
 
 note = server._open_ticket_note(phone)
-assert note and "open" in note and "technical" in note, note
+assert note and "open" in note and "בעיה טכנית" in note and "technical" not in note, note
 assert "TKT-1001" not in note, "ticket ids must stay out of the model-facing note"
 # a phone with no tickets gets no note
 assert server._open_ticket_note("+972500000999") is None

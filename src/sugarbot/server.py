@@ -66,6 +66,7 @@ import hmac
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -93,6 +94,7 @@ from sugarbot.assistant import (
     SYSTEM_PROMPT,
     TOOL_FNS,
     TOOLS,
+    _EMAIL_RE,
     _usage_dict,
     add_usage,
     client,
@@ -889,6 +891,23 @@ def _ticket_thread_lines(ticket_id: str) -> list[str]:
         return _thread_lines_cache.get(ticket_id, [])
 
 
+# Customer-facing subject per reason key. The raw key (login_email ...) is an
+# internal identifier the reply guard withholds, so the model never sees it
+# in the ticket note either.
+_REASON_SUBJECTS = {
+    "login_email": "לא מצליח להתחבר עם המייל",
+    "help_desk": "שיחה עם נציג שירות",
+    "forgot_password": "שכחתי סיסמה",
+    "technical": "בעיה טכנית",
+    "remove_account": "הסרת החשבון",
+    "report": "דיווח",
+    "stop_payment": "הפסקת תשלום",
+    "id_verification": "אימות תעודת זהות",
+    "photo_verification": "אימות תמונה",
+    "other": "אחר",
+}
+
+
 def _open_ticket_note(phone: str) -> str | None:
     """A system note listing recent support tickets for this conversation, so
     the model can report status and not open a duplicate. When the admin API is
@@ -904,7 +923,8 @@ def _open_ticket_note(phone: str) -> str | None:
     for t in tickets:
         status = t["status"] or "נשלחה"
         when = t["created_at"].strftime("%Y-%m-%d") if t["created_at"] else ""
-        lines.append(f"- פנייה (סטטוס: {status}, נושא: {t['reason']}, נפתחה: {when})")
+        subject = _REASON_SUBJECTS.get(t["reason"], "אחר")
+        lines.append(f"- פנייה (סטטוס: {status}, נושא: {subject}, נפתחה: {when})")
     parts = ["הערת מערכת - פניות תמיכה שנפתחו ללקוח לאחרונה:"] + lines
     # Live thread for the newest ticket whose id the admin backend can resolve
     # (a UUID). Not simply tickets[0]: a newer non-UUID ticket (e.g. an
@@ -1262,6 +1282,147 @@ def _run_chat_locked(
     yield from _run_rounds(phone, _prepare_messages(phone, history, batch))
 
 
+# ---------- leaked-reasoning guard ----------
+# With reasoning_effort="none" the model has no hidden scratchpad, and now and
+# then it writes its plan into the reply ("We need ... submit ticket reason
+# login_email ... Let's call.") instead of making the tool call. The final
+# round's text goes to WhatsApp verbatim, so it is checked first: a leak gets
+# one corrective round; a second leak sends a fixed confirmation if the turn
+# already filed a ticket, else fails the turn with the customer-safe error.
+
+# Tool-result fields the model reads but the customer must never see. Tool
+# names, parameters and enum values are collected from the schemas above.
+_RESULT_FIELDS = (
+    "logged_in", "login_url", "login_required", "is_premium", "on_account",
+    "hours_since_login",
+)
+
+
+def _schema_identifiers(node) -> set[str]:
+    out: set[str] = set()
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "name" and isinstance(v, str):
+                out.add(v)
+            elif k == "properties" and isinstance(v, dict):
+                out.update(v)
+            elif k == "enum" and isinstance(v, list):
+                out.update(x for x in v if isinstance(x, str))
+            out |= _schema_identifiers(v)
+    elif isinstance(node, list):
+        for x in node:
+            out |= _schema_identifiers(x)
+    return out
+
+
+# Only snake_case ones: plain words like "email", "text" or "report" are
+# things a genuine reply can say. ASCII lookarounds rather than \b: Hebrew
+# letters are \w too, so \b would not fire in "הlogin_url".
+_INTERNAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    + "|".join(
+        re.escape(n)
+        for n in sorted(
+            n for n in _schema_identifiers(TOOLS_ALL) | set(_RESULT_FIELDS) if "_" in n
+        )
+    )
+    + r")(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_HEBREW_RE = re.compile(r"[\u0590-\u05ff]")
+# Any letter that is not Hebrew (Latin, Cyrillic, Arabic ...).
+_OTHER_LETTER_RE = re.compile(r"[^\W\d_\u0590-\u05ff]")
+_LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z']+")
+# Latin text a reply legitimately carries (links, emails). Applied before the
+# language checks only — identifiers are matched on the raw text, so a tool
+# name glued to an email or written inside brackets is still caught.
+_LINK_RE = re.compile(r"https?://\S+|www\.\S+|" + _EMAIL_RE.pattern)
+# The bracketed redaction/media placeholders in USER messages ([מייל],
+# [המשתמש צירף ...]) are Hebrew but not the customer's own words.
+_PLACEHOLDER_RE = re.compile(r"\[[^\]]*\]")
+# The model talking about the customer in the third person, or about its
+# tools, is a plan and never a reply — whatever language it is in.
+_PLAN_RE = re.compile(
+    r"\b(?:we need|i should|let'?s call|the user|the customer|"
+    r"they (?:want|need|said|gave|agreed|asked|provided)|"
+    r"call(?:ing)? the tool|the tool|tool will|must use|"
+    r"need (?:to )?(?:open|submit|call))\b"
+    r"|לקרוא לכלי|אקרא לכלי|נקרא לכלי|בוא נקרא|"
+    r"(?:הלקוח|המשתמש) (?:נתן|נתנה|רוצה|ביקש|ביקשה|אמר|אמרה|כתב|כתבה|שלח|שלחה)",
+    re.IGNORECASE,
+)
+# A reply to a Hebrew speaker with this many Latin words and no Hebrew at all
+# is English prose; a Hebrew reply with a Latin brand list keeps its Hebrew.
+_ENGLISH_REPLY_WORDS = 4
+# A Latin-letter message shorter than this ("ok", "thanks") says nothing
+# about the customer's language; look further back.
+_LANGUAGE_MIN_WORDS = 3
+
+_LEAK_RETRY_NOTE = (
+    "ההודעה הקודמת שלך (מעליי) נחסמה ולא נשלחה ללקוח: היא כללה תכנון פנימי, "
+    "שמות כלים/שדות, או טקסט שלא בשפה של הלקוח. כל מה שתכתוב/י עכשיו נשלח "
+    "ללקוח בוואטסאפ כמו שהוא. אם צריך כלי - קרא/י לו עכשיו, בלי לכתוב טקסט. "
+    "אחרת כתוב/כתבי רק את התשובה ללקוח, בשפה שבה הוא כותב, בלי לתאר מה את/ה עושה."
+)
+# When the turn already filed a ticket and the model cannot produce a clean
+# confirmation, the customer gets this instead of a "temporary error" that
+# would send them back to re-ask (and risk a duplicate ticket).
+_TICKET_FILED_FALLBACK = {
+    True: "הפנייה נשלחה לצוות, ונציג אנושי יחזור אליך בשעות הפעילות (א'-ה' 9:00-17:00) 🙂",
+    False: (
+        "Your request has been passed to the team, and a representative will get "
+        "back to you during business hours (Sun-Thu 9:00-17:00) 🙂"
+    ),
+}
+
+
+def _customer_writes_hebrew(messages: list[dict]) -> bool:
+    """Language of the customer's latest message that has enough words in it.
+
+    Decided by the dominant script, so a Hebrew message quoting an English
+    error stays Hebrew and vice versa. A message with no letters (an email, a
+    number, an emoji) or a short Latin acknowledgement ("ok") says nothing
+    about language, so look further back; Hebrew is the default.
+    """
+    for m in reversed(messages):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        prose = _LINK_RE.sub(" ", content if isinstance(content, str) else "")
+        prose = _PLACEHOLDER_RE.sub(" ", prose)
+        hebrew = len(_HEBREW_RE.findall(prose))
+        other = len(_OTHER_LETTER_RE.findall(prose))
+        if hebrew >= other and hebrew > 0:
+            return True
+        if other > hebrew:
+            words = sum(1 for w in prose.split() if _OTHER_LETTER_RE.search(w))
+            if words >= _LANGUAGE_MIN_WORDS:
+                return False
+    return True
+
+
+def _leak_reason(text: str, hebrew_customer: bool) -> str | None:
+    """Why `text` must not reach the customer, or None if it is a clean reply."""
+    if _INTERNAL_RE.search(text):
+        return "internal_identifier"
+    prose = _LINK_RE.sub(" ", text)
+    if (
+        hebrew_customer
+        and not _HEBREW_RE.search(prose)
+        and len(_LATIN_WORD_RE.findall(prose)) >= _ENGLISH_REPLY_WORDS
+    ):
+        return "english_prose"
+    if _PLAN_RE.search(prose):
+        return "plan_text"
+    return None
+
+
 def _run_rounds(
     phone: str,
     messages: list[dict],
@@ -1292,6 +1453,8 @@ def _run_rounds(
     escalate_requested = False
     ticket_gated = False
     ticket_filed = False
+    hebrew_customer = _customer_writes_hebrew(messages)
+    leak_retried = False
 
     turn_t0 = time.monotonic()
     rounds_used = 0
@@ -1350,8 +1513,20 @@ def _run_rounds(
                     }
                     for tc in msg.tool_calls
                 ]
-                db.append_message(phone, "assistant", content=msg.content, tool_calls=tc_payload)
-                messages.append({"role": "assistant", "content": msg.content, "tool_calls": tc_payload})
+                # Preamble text next to a tool call is never sent, but it is
+                # stored and replayed; a leaked plan there would teach later
+                # turns to repeat it (and shows up in the history UI), so it
+                # is dropped from the row. The call itself is kept as-is.
+                preamble = msg.content or None
+                if preamble and _leak_reason(preamble, hebrew_customer):
+                    print(
+                        f"[chat] tool-round preamble dropped phone={phone} round={i + 1} "
+                        f"chars={len(preamble)}",
+                        file=sys.stderr,
+                    )
+                    preamble = None
+                db.append_message(phone, "assistant", content=preamble, tool_calls=tc_payload)
+                messages.append({"role": "assistant", "content": preamble, "tool_calls": tc_payload})
 
                 for tc in msg.tool_calls:
                     name = tc.function.name
@@ -1427,13 +1602,40 @@ def _run_rounds(
                     )
                 continue
 
+            text = msg.content or ""
+            leak = _leak_reason(text, hebrew_customer)
+            if leak:
+                print(
+                    f"[chat] reply withheld phone={phone} round={i + 1} "
+                    f"reason={leak} chars={len(text)}",
+                    file=sys.stderr,
+                )
+                if leak_retried or i == MAX_TOOL_ROUNDS - 1:
+                    if not ticket_filed:
+                        raise RuntimeError(f"reply withheld ({leak}); no retry round left")
+                    # The ticket exists: confirm it deterministically rather
+                    # than fail the turn and invite a duplicate request.
+                    text = _TICKET_FILED_FALLBACK[hebrew_customer]
+                    buffered = [text]
+                    print(
+                        f"[chat] ticket-filed fallback reply phone={phone}",
+                        file=sys.stderr,
+                    )
+                else:
+                    leak_retried = True
+                    # In-flight only, never persisted: the model must see what
+                    # it is replacing, but replaying the withheld text on later
+                    # turns would teach them to repeat it.
+                    messages.append({"role": "assistant", "content": text})
+                    messages.append({"role": "system", "content": _LEAK_RETRY_NOTE})
+                    continue
+
             # Final round — no tool calls. Flush the buffered answer downstream
             # as ONE delta: WhatsApp has no streaming (the integration joins
             # deltas into a single message anyway), and per-token events cost a
             # threadpool hop + an HTTP chunk write each.
             if buffered:
                 yield {"type": "delta", "text": "".join(buffered)}
-            text = msg.content or ""
             # Deterministic login-link fallback (Remark 12): if the account status
             # returned a login_url this turn, the model is talking about logging in,
             # but the literal URL is missing from the reply — append it so the
