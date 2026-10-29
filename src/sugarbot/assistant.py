@@ -45,16 +45,27 @@ REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "").strip()
 # because the prompt below states the threshold to the customer — a hardcoded
 # "48" there would contradict the tool on any non-default deployment.
 ACCOUNT_FRESHNESS_HOURS = int(os.getenv("ACCOUNT_FRESHNESS_HOURS", "48"))
-# Behaviour instructions + the KB index. Both are static, so the whole system
-# prompt stays the cacheable prefix; the model reads topic files on demand via
-# the read_kb tool instead of carrying the full knowledge base every turn.
-SYSTEM_PROMPT = (
-    SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").replace(
-        "{{ACCOUNT_FRESHNESS_HOURS}}", str(ACCOUNT_FRESHNESS_HOURS)
-    )
-    + "\n\n"
-    + kb.build_index()
+_BASE_PROMPT = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").replace(
+    "{{ACCOUNT_FRESHNESS_HOURS}}", str(ACCOUNT_FRESHNESS_HOURS)
 )
+_prompt_memo: tuple[int, str] | None = None
+
+
+def system_prompt() -> str:
+    """Behaviour instructions + the KB index.
+
+    Static between KB edits, so the prompt stays the cacheable prefix; it is
+    rebuilt only when kb_version changes (an admin saved a document). The model
+    reads topic files on demand via the read_kb tool instead of carrying the
+    full knowledge base every turn.
+    """
+    global _prompt_memo
+    version = kb.kb_version()
+    memo = _prompt_memo
+    if memo is None or memo[0] != version:
+        memo = _prompt_memo = (version, _BASE_PROMPT + "\n\n" + kb.build_index())
+    return memo[1]
+
 
 # Picks up OPENAI_API_KEY from env. Explicit per-request timeout: the SDK
 # default is 600s, and with the sync streaming loop each hung request pins a
@@ -223,7 +234,7 @@ def reply(history: list[dict], user_message: str, stream: bool = True) -> tuple[
     the final answer streams to stdout as before.
     """
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt()},
         *history,
         {"role": "user", "content": user_message},
     ]

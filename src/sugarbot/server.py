@@ -91,7 +91,6 @@ from sugarbot.assistant import (
     MAX_TOOL_ROUNDS,
     MODEL,
     REASONING_EFFORT,
-    SYSTEM_PROMPT,
     TOOL_FNS,
     TOOLS,
     _EMAIL_RE,
@@ -102,6 +101,7 @@ from sugarbot.assistant import (
     redact_pii,
     repair_tool_calls,
     scrub_messages,
+    system_prompt,
 )
 
 load_dotenv()
@@ -1237,7 +1237,7 @@ def _prepare_messages(
     exactly the same conversation.
     """
     batch = batch or []
-    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+    messages: list[dict] = [{"role": "system", "content": system_prompt()}, *history]
     messages = scrub_messages(messages)
     # Attach this turn's media to the user message it came with as multimodal
     # content, so the model actually sees the screenshot/receipt. Past turns keep
