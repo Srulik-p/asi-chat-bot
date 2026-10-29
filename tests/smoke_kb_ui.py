@@ -1,4 +1,4 @@
-"""Smoke test: Streamlit knowledge-base editor page (ui/pages/1_knowledge_base.py).
+"""Smoke test: Streamlit knowledge-base editor page (ui/kb_editor.py).
 
 Run with:
     uv run python tests/smoke_kb_ui.py
@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT / "ui"))
 
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
-PAGE = str(ROOT / "ui" / "pages" / "1_knowledge_base.py")
+PAGE = str(ROOT / "ui" / "kb_editor.py")
 
 DOCS = [
     {"name": "pricing.md", "title": "מחירים", "keywords": ["מחיר"], "summary": "s",
@@ -78,23 +78,39 @@ def start():
     return at.run()
 
 
+def name_input(at):
+    return at.text_input(key="editor_name_input")
+
+
+def doc_buttons(at):
+    return [b for b in at.button if (b.key or "").startswith("kb_open_")]
+
+
 def submit_button(at):
-    return next(b for b in at.button if b.label == "שמור")
+    return next(b for b in at.button if b.label == "שמור שינויים")
 
 
-# 1. list renders, hidden docs are suffixed
+# 1. index lists every document; the open one is primary, hidden ones say so
 patches, put, post = run()
 with patches[0], patches[1], patches[2]:
     at = start()
     assert not at.exception, at.exception
-    opts = at.selectbox[0].options
-    assert opts == ["מחירים  (pricing.md)", "טיוטה  (_draft.md) [מוסתר]"], opts
+    docs = doc_buttons(at)
+    assert [b.label for b in docs] == ["מחירים", "טיוטה"], [b.label for b in docs]
+    assert [b.proto.type for b in docs] == ["primary", "tertiary"], [b.proto.type for b in docs]
+    assert "מוסתר מהבוט" in docs[1].help, docs[1].help
+    assert any(c.value == "הגרסה הנוכחית" for c in at.caption), [c.value for c in at.caption]
+
+    # search narrows the index by keyword
+    at.text_input(key="kb_query").set_value("מחיר").run()
+    assert [b.label for b in doc_buttons(at)] == ["מחירים"], [b.label for b in doc_buttons(at)]
+    at.text_input(key="kb_query").set_value("").run()
 
     # 2. saving is disabled while the editor name is empty
     assert submit_button(at).disabled
 
     # 3. save sends base_revision_id and split/stripped keywords
-    at.sidebar.text_input[0].set_value("דנה").run()
+    name_input(at).set_value("דנה").run()
     assert not submit_button(at).disabled
     kw = next(t for t in at.text_input if t.label.startswith("מילות מפתח"))
     kw.set_value("  מחיר , תשלום,, ").run()
@@ -113,7 +129,7 @@ conflict = mock.Mock(return_value=Resp(409, {"detail": "conflict", "current_revi
 patches, put, post = run(put=conflict)
 with patches[0], patches[1], patches[2]:
     at = start()
-    at.sidebar.text_input[0].set_value("דנה").run()
+    name_input(at).set_value("דנה").run()
     submit_button(at).click().run()
     assert any(e.value == "מישהו אחר שמר את הקובץ בינתיים. טען/י מחדש ונסה/י שוב." for e in at.error), [e.value for e in at.error]
     assert any(b.label == "טען מחדש" for b in at.button)
@@ -123,7 +139,7 @@ bad = mock.Mock(return_value=Resp(422, {"detail": [{"loc": ["body", "title"], "m
 patches, put, post = run(put=bad)
 with patches[0], patches[1], patches[2]:
     at = start()
-    at.sidebar.text_input[0].set_value("דנה").run()
+    name_input(at).set_value("דנה").run()
     submit_button(at).click().run()
     texts = [e.value for e in at.error]
     assert any("title: String should have at least 1 character" in t for t in texts), texts
@@ -133,7 +149,7 @@ bad = mock.Mock(return_value=Resp(422, {"detail": "invalid document name"}))
 patches, put, post = run(put=bad)
 with patches[0], patches[1], patches[2]:
     at = start()
-    at.sidebar.text_input[0].set_value("דנה").run()
+    name_input(at).set_value("דנה").run()
     submit_button(at).click().run()
     assert any("invalid document name" in e.value for e in at.error), [e.value for e in at.error]
 
@@ -141,7 +157,7 @@ with patches[0], patches[1], patches[2]:
 patches, put, post = run()
 with patches[0], patches[1], patches[2]:
     at = start()
-    at.sidebar.text_input[0].set_value("דנה").run()
+    name_input(at).set_value("דנה").run()
     next(b for b in at.button if b.key == "kb_restore_5").click().run()
     assert not at.exception, at.exception
     assert post.call_count == 1
@@ -160,11 +176,23 @@ with patches[0], patches[1], patches[2]:
     at.text_input(key="kb_new_name").set_value("new-topic").run()
     next(b for b in at.button if b.label == "צור").click().run()
     assert not at.exception, at.exception
-    assert at.subheader[0].value == "new-topic.md", at.subheader[0].value
+    assert any("new-topic.md" in m.value for m in at.markdown), [m.value for m in at.markdown]
+    assert doc_buttons(at)[0].label == "new-topic.md (חדש)", [b.label for b in doc_buttons(at)]
     # a never-saved document starts with no base revision
-    at.sidebar.text_input[0].set_value("דנה").run()
+    name_input(at).set_value("דנה").run()
     submit_button(at).click().run()
     assert put.call_args.kwargs["json"]["base_revision_id"] is None
     assert put.call_args.args[0].endswith("/kb/new-topic.md")
+    assert put.call_args.kwargs["json"]["hidden"] is False
+
+# 9. a new '_' file starts hidden from the bot
+patches, put, post = run()
+with patches[0], patches[1], patches[2]:
+    at = start()
+    at.text_input(key="kb_new_name").set_value("_notes").run()
+    next(b for b in at.button if b.label == "צור").click().run()
+    name_input(at).set_value("דנה").run()
+    submit_button(at).click().run()
+    assert put.call_args.kwargs["json"]["hidden"] is True, put.call_args.kwargs["json"]
 
 print("OK")
