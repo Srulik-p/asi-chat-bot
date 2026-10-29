@@ -62,6 +62,9 @@ r = c.put("/kb/pricing.md%0A", json={**bad, "title": "t"}, headers=H)
 assert r.status_code == 422 and r.json()["detail"] == "invalid document name", r.text
 assert c.put("/kb/pricing.md", json={**bad, "title": "t", "body": ""}, headers=H).status_code == 422
 assert c.put("/kb/pricing.md", json={**bad, "title": "t", "keywords": ["a", " "]}, headers=H).status_code == 422
+assert c.put("/kb/pricing.md", json={**bad, "title": "a\nb"}, headers=H).status_code == 422   # index is one line per doc
+assert c.put("/kb/pricing.md", json={**bad, "title": "a\rb"}, headers=H).status_code == 422
+assert c.put("/kb/pricing.md", json={**bad, "title": "t", "keywords": ["ok", "x\ny"]}, headers=H).status_code == 422
 assert c.put("/kb/pricing.md", json={**bad, "title": "t", "saved_by": "  "}, headers=H).status_code == 422
 assert c.put("/kb/pricing.md", json={**bad, "title": "t"}, headers={"X-Internal-Secret": "x"}).status_code == 401
 assert c.get("/kb", headers=H).json()["version"] == 1   # rejected saves changed nothing
@@ -99,5 +102,10 @@ r = c.post("/kb/pricing.md/restore", json={"revision_id": rev1, "saved_by": "d",
 assert r.status_code == 409 and "current_revision_id" in r.json()
 assert c.post("/kb/Bad Name.md/restore", json={"revision_id": 1, "saved_by": "d", "base_revision_id": None}, headers=H).status_code == 422
 assert c.post("/kb/pricing.md/restore", json={"revision_id": rev1, "saved_by": "", "base_revision_id": None}, headers=H).status_code == 422
+
+# Startup warms the KB cache from the DB (lifespan enters only via the context manager).
+kb._docs, kb._version = None, -1
+with TestClient(server.app):
+    assert kb._version >= 1, kb._version   # read directly: kb_version() would refresh on its own
 
 print("OK")

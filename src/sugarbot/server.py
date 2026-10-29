@@ -201,6 +201,7 @@ async def lifespan(_app: FastAPI):
         )
     anyio.to_thread.current_default_thread_limiter().total_tokens = SERVER_THREADPOOL_SIZE
     db.init_db()
+    kb.refresh(force=True)
     # One line per instance start: import->ready is the app's share of a cold
     # start (the Cloud Run request log holds the rest).
     print(f"[boot] ready secs={time.monotonic() - _PROCESS_T0:.2f}", file=sys.stderr)
@@ -422,11 +423,23 @@ class KbDocumentIn(BaseModel):
             raise ValueError("must not be empty")
         return v
 
+    # Each document is one line in the system-prompt index.
+    @field_validator("title")
+    @classmethod
+    def _title_single_line(cls, v: str) -> str:
+        v = v.strip()
+        if "\n" in v or "\r" in v:
+            raise ValueError("title must be a single line")
+        return v
+
     @field_validator("keywords")
     @classmethod
     def _keywords_non_empty(cls, v: list[str]) -> list[str]:
-        if any(not k.strip() for k in v):
+        v = [k.strip() for k in v]
+        if any(not k for k in v):
             raise ValueError("keywords must be non-empty strings")
+        if any("\n" in k or "\r" in k for k in v):
+            raise ValueError("keywords must be single-line")
         return v
 
     _saved_by = field_validator("saved_by")(_require_saved_by)

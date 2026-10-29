@@ -34,6 +34,13 @@ markdown files no longer changes production; the database is the source of
 truth. Make content changes on the knowledge base page of the staff UI
 (`ui/pages/1_knowledge_base.py`). `KB_REFRESH_SECONDS` (default 30) bounds how
 long an instance can serve a stale snapshot after another instance saves.
+
+Rollback: rolling Cloud Run back to an image older than migration 0008
+crash-loops, because the old image's `alembic upgrade head` cannot locate
+revision 0008. Prefer forward-fixing. If a rollback is unavoidable: export the
+edits first (`GET /kb` plus `GET /kb/{name}` per document), run
+`alembic downgrade 0007` (drops all KB edits and history), then redeploy the
+old image.
 """
 
 import os
