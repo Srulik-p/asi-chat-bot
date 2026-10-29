@@ -19,7 +19,6 @@ Env:
 """
 
 import base64
-import hmac
 import json
 import mimetypes
 import os
@@ -28,15 +27,12 @@ import sys
 
 import requests
 import streamlit as st
+from common import API_URL, REQUEST_TIMEOUT, headers, require_staff
 from dotenv import load_dotenv
 
 load_dotenv()
 
-API_URL = os.getenv("CHAT_API_URL", "http://localhost:8000").rstrip("/")
-INTERNAL_SECRET = os.getenv("INTERNAL_API_SECRET", "")
-UI_PASSWORD = os.getenv("UI_PASSWORD", "")
 DEFAULT_PHONE = os.getenv("DEFAULT_TEST_PHONE", "0500000000")
-REQUEST_TIMEOUT = 120
 
 st.set_page_config(
     page_title="שוגר דדי - שירות לקוחות",
@@ -84,30 +80,7 @@ st.title("שירות לקוחות שוגר דדי")
 st.caption(f"backend: {API_URL}")
 
 
-# ---------- staff auth gate ----------
-# This UI holds INTERNAL_API_SECRET and can read/impersonate/purge any
-# customer's conversation by phone number. Local dev against a localhost
-# backend is exempt; any other backend requires UI_PASSWORD.
-
-_LOCAL_BACKEND = API_URL.startswith(("http://localhost", "http://127.0.0.1"))
-
-if UI_PASSWORD:
-    if not st.session_state.get("ui_authed"):
-        with st.form("staff_gate"):
-            supplied = st.text_input("סיסמת צוות", type="password")
-            if st.form_submit_button("כניסה", use_container_width=True):
-                if hmac.compare_digest(supplied, UI_PASSWORD):
-                    st.session_state.ui_authed = True
-                    st.rerun()
-                else:
-                    st.error("סיסמה שגויה")
-        st.stop()
-elif not _LOCAL_BACKEND:
-    st.error(
-        "UI_PASSWORD אינו מוגדר. ממשק זה חושף נתוני לקוחות (קריאה, התחזות ומחיקה "
-        "לפי מספר טלפון) ולכן חסום עד שתוגדר סיסמת צוות בסביבה."
-    )
-    st.stop()
+require_staff()
 
 
 # ---------- phone ----------
@@ -125,15 +98,11 @@ def normalize_phone(raw: str) -> str | None:
 
 # ---------- backend client ----------
 
-def _headers() -> dict:
-    return {"X-Internal-Secret": INTERNAL_SECRET, "Content-Type": "application/json"}
-
-
 def fetch_history(phone: str) -> list[dict]:
     r = requests.get(
         f"{API_URL}/chat/history",
         params={"phoneNumber": phone},
-        headers=_headers(),
+        headers=headers(),
         timeout=REQUEST_TIMEOUT,
     )
     r.raise_for_status()
@@ -144,7 +113,7 @@ def reset_history(phone: str) -> None:
     requests.post(
         f"{API_URL}/chat/reset",
         json={"phoneNumber": phone},
-        headers=_headers(),
+        headers=headers(),
         timeout=REQUEST_TIMEOUT,
     ).raise_for_status()
 
@@ -154,7 +123,7 @@ def purge_user(phone: str) -> dict:
     r = requests.post(
         f"{API_URL}/user/delete",
         json={"phoneNumber": phone},
-        headers=_headers(),
+        headers=headers(),
         timeout=REQUEST_TIMEOUT,
     )
     r.raise_for_status()
@@ -178,7 +147,7 @@ def stream_assistant_reply(phone: str, message: str, media: list[dict] | None = 
         with requests.post(
             f"{API_URL}/chat/message",
             json={"phoneNumber": phone, "message": message, "media": media or []},
-            headers=_headers(),
+            headers=headers(),
             timeout=REQUEST_TIMEOUT,
             stream=True,
         ) as r:

@@ -11,7 +11,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
 
 # Thin UI client — talks to the backend over HTTP, no LLM/KB in this image.
-COPY ui/app.py ./ui/app.py
+COPY ui/ ./ui/
 
 ENV PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH"
