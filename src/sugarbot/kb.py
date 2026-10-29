@@ -28,6 +28,12 @@ single `read_kb` tool then returns the full body of one or more files.
 
 Hidden documents (and, in the file fallback, files whose name starts with `_`)
 are NOT indexed and NOT exposed to the model (internal notes).
+
+Rollout: once migration 0008 has seeded `kb_documents`, editing the repo
+markdown files no longer changes production; the database is the source of
+truth. Make content changes on the knowledge base page of the staff UI
+(`ui/pages/1_knowledge_base.py`). `KB_REFRESH_SECONDS` (default 30) bounds how
+long an instance can serve a stale snapshot after another instance saves.
 """
 
 import os
