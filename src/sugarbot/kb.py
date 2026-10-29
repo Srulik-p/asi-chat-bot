@@ -16,8 +16,10 @@ frontmatter:
 cache. Instances share no memory, so the cache is keyed on the DB's
 `kb_version` counter: it is re-checked at most once per KB_REFRESH_SECONDS and
 reloaded when another instance (or this one) saved a change. If the database
-errors, `get_docs()` serves the markdown files instead (`kb_version()` is -1)
-and retries the database on the next refresh window.
+errors, the last good snapshot is kept (so a document hidden or edited by
+staff never reverts during a blip) and the database is retried on the next
+refresh window. Only a process with no snapshot yet serves the markdown files
+instead (`kb_version()` is -1).
 
 `build_index()` renders a compact catalog (filenames + titles + keywords)
 that is injected into the cached system prompt, so the model can pick the
@@ -116,11 +118,18 @@ def refresh(force: bool = False) -> None:
                 _version = version
             _fallback_logged = False
         except Exception as e:
-            if not _fallback_logged:
-                print(f"[kb] falling back to files: {e}", file=sys.stderr)
-                _fallback_logged = True
-            _docs = _load_files()
-            _version = -1
+            if _version >= 0:
+                # Keep the last good snapshot: the repo files may predate edits
+                # and would resurface documents staff hid.
+                if not _fallback_logged:
+                    print(f"[kb] DB unavailable, keeping cached v{_version}: {e}", file=sys.stderr)
+                    _fallback_logged = True
+            else:
+                if not _fallback_logged:
+                    print(f"[kb] falling back to files: {e}", file=sys.stderr)
+                    _fallback_logged = True
+                _docs = _load_files()
+                _version = -1
         _checked_at = time.monotonic()
 
 

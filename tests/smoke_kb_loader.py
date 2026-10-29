@@ -5,7 +5,8 @@ Run with:
 
 Verifies kb.get_docs() reads visible documents from the DB, reloads when
 another instance bumps kb_version, drops documents hidden via an edit, and
-falls back to the markdown files (without raising) when the DB is unavailable.
+keeps its last snapshot during a DB outage, and falls back to the markdown files
+(without raising) only when it has no snapshot yet.
 """
 import os
 import pathlib
@@ -50,7 +51,16 @@ kb.refresh(force=True)
 assert "pricing.md" not in kb.get_docs()
 assert "pricing.md" not in kb.build_index()
 
-# DB failure falls back to files without raising.
+# A DB outage after a good load keeps the cached snapshot: a document hidden
+# via edit must not resurface from the repo files.
+with m.patch.object(db, "get_kb_version", side_effect=RuntimeError("db blip")):
+    kb.refresh(force=True)
+    assert kb.kb_version() == 3
+    assert "pricing.md" not in kb.get_docs()
+    assert "pricing.md" not in kb.build_index()
+
+# Cold process (no snapshot) with the DB down falls back to files without raising.
+kb._docs, kb._version = None, -1
 with m.patch.object(db, "get_kb_version", side_effect=RuntimeError("db down")):
     kb.refresh(force=True)
     assert kb.kb_version() == -1
