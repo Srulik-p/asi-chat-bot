@@ -700,6 +700,15 @@ def save_kb_document(
         "hidden": hidden,
     }
     with _engine.begin() as conn:
+        # Row lock on kb_version serializes every KB save (Postgres READ
+        # COMMITTED would otherwise let concurrent saves both pass the
+        # conflict check and write the same version). SQLite ignores FOR UPDATE.
+        row = conn.execute(
+            select(app_state_table.c.value)
+            .where(app_state_table.c.key == "kb_version")
+            .with_for_update()
+        ).first()
+        version = int(row[0]["v"]) if row and isinstance(row[0], dict) else 0
         current = _latest_revision_id(conn, name)
         if current != base_revision_id:
             raise KbConflict(current)
@@ -717,10 +726,6 @@ def save_kb_document(
             )
         )
         revision_id = result.inserted_primary_key[0]
-        row = conn.execute(
-            select(app_state_table.c.value).where(app_state_table.c.key == "kb_version")
-        ).first()
-        version = int(row[0]["v"]) if row and isinstance(row[0], dict) else 0
         _set_app_state("kb_version", {"v": version + 1}, conn=conn)
     return revision_id
 
