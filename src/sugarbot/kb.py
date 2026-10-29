@@ -27,7 +27,7 @@ _DELIM = "---"
 _DELIM_NL = "\n---\n"  # require newline on both sides so body `---` rules don't truncate
 
 
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
+def parse_frontmatter(text: str) -> tuple[dict, str]:
     """Return (meta, body). Minimal parser: title/summary strings, keywords list."""
     if not text.startswith(_DELIM):
         return {}, text
@@ -46,6 +46,9 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
         else:
             meta[key] = val
     return meta, body
+
+
+_parse_frontmatter = parse_frontmatter
 
 
 def _load() -> dict[str, dict]:

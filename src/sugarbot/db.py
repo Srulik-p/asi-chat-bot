@@ -154,6 +154,35 @@ support_tickets_table = Table(
 )
 
 
+kb_documents_table = Table(
+    "kb_documents",
+    _metadata,
+    Column("name", String, primary_key=True),
+    Column("title", String, nullable=False),
+    Column("keywords", JSON, nullable=False),
+    Column("summary", Text, nullable=False, default=""),
+    Column("body", Text, nullable=False),
+    Column("hidden", Boolean, nullable=False, default=False),
+    Column("updated_at", DateTime, nullable=False),
+    Column("updated_by", String),
+)
+
+kb_revisions_table = Table(
+    "kb_revisions",
+    _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String, nullable=False, index=True),
+    Column("title", String),
+    Column("keywords", JSON),
+    Column("summary", Text),
+    Column("body", Text),
+    Column("hidden", Boolean),
+    Column("saved_at", DateTime, nullable=False),
+    Column("saved_by", String),
+    Column("note", String),
+)
+
+
 def init_db() -> None:
     """Bring the DB schema up to the latest Alembic revision.
 
@@ -527,7 +556,7 @@ def recent_support_tickets(
     ]
 
 
-def _set_app_state(key: str, value) -> None:
+def _set_app_state(key: str, value, conn=None) -> None:
     insert = pg_insert if _IS_POSTGRES else sqlite_insert
     now = datetime.now(timezone.utc)
     stmt = insert(app_state_table).values(key=key, value=value, updated_at=now)
@@ -535,6 +564,9 @@ def _set_app_state(key: str, value) -> None:
         index_elements=[app_state_table.c.key],
         set_={"value": value, "updated_at": now},
     )
+    if conn is not None:
+        conn.execute(stmt)
+        return
     with _engine.begin() as conn:
         conn.execute(stmt)
 
@@ -561,3 +593,161 @@ def load_admin_token() -> Optional[dict]:
     or None if never saved."""
     value = _get_app_state("admin_token")
     return value if isinstance(value, dict) else None
+
+
+class KbConflict(Exception):
+    """The document was saved by someone else since the caller loaded it."""
+
+    def __init__(self, current_revision_id: Optional[int]):
+        super().__init__(f"kb document changed (latest revision {current_revision_id})")
+        self.current_revision_id = current_revision_id
+
+
+def _latest_revision_id(conn, name: str) -> Optional[int]:
+    return conn.execute(
+        select(func.max(kb_revisions_table.c.id)).where(kb_revisions_table.c.name == name)
+    ).scalar()
+
+
+def _kb_doc_dict(row, latest_revision_id: Optional[int]) -> dict:
+    d = dict(row)
+    d["updated_at"] = _as_utc(d["updated_at"])
+    d["latest_revision_id"] = latest_revision_id
+    return d
+
+
+def list_kb_documents() -> list[dict]:
+    """Every document without its body, plus latest_revision_id, by name."""
+    cols = [c for c in kb_documents_table.c if c.name != "body"]
+    latest = (
+        select(
+            kb_revisions_table.c.name,
+            func.max(kb_revisions_table.c.id).label("latest_revision_id"),
+        )
+        .group_by(kb_revisions_table.c.name)
+        .subquery()
+    )
+    stmt = (
+        select(*cols, latest.c.latest_revision_id)
+        .select_from(
+            kb_documents_table.outerjoin(
+                latest, latest.c.name == kb_documents_table.c.name
+            )
+        )
+        .order_by(kb_documents_table.c.name)
+    )
+    with _engine.connect() as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [
+        {**dict(r), "updated_at": _as_utc(r["updated_at"])} for r in rows
+    ]
+
+
+def get_kb_document(name: str) -> Optional[dict]:
+    with _engine.connect() as conn:
+        row = conn.execute(
+            select(kb_documents_table).where(kb_documents_table.c.name == name)
+        ).mappings().first()
+        if row is None:
+            return None
+        return _kb_doc_dict(row, _latest_revision_id(conn, name))
+
+
+def load_kb_documents() -> dict[str, dict]:
+    """{name: {title, keywords, summary, body, hidden}} for every document,
+    hidden ones included — the caller decides what to expose."""
+    with _engine.connect() as conn:
+        rows = conn.execute(select(kb_documents_table)).mappings().all()
+    return {
+        r["name"]: {
+            "title": r["title"],
+            "keywords": r["keywords"],
+            "summary": r["summary"],
+            "body": r["body"],
+            "hidden": bool(r["hidden"]),
+        }
+        for r in rows
+    }
+
+
+def get_kb_version() -> int:
+    value = _get_app_state("kb_version")
+    return int(value["v"]) if isinstance(value, dict) and "v" in value else 0
+
+
+def save_kb_document(
+    name: str,
+    *,
+    title: str,
+    keywords: list,
+    summary: str,
+    body: str,
+    hidden: bool,
+    saved_by: Optional[str],
+    note: Optional[str] = None,
+    base_revision_id: Optional[int],
+) -> int:
+    """Upsert a document, snapshot it as a revision and bump kb_version, all in
+    one transaction. Raises KbConflict if base_revision_id is not the document's
+    current latest revision id (None when it has no revision yet)."""
+    insert = pg_insert if _IS_POSTGRES else sqlite_insert
+    now = datetime.now(timezone.utc)
+    fields = {
+        "title": title,
+        "keywords": keywords,
+        "summary": summary,
+        "body": body,
+        "hidden": hidden,
+    }
+    with _engine.begin() as conn:
+        current = _latest_revision_id(conn, name)
+        if current != base_revision_id:
+            raise KbConflict(current)
+        stmt = insert(kb_documents_table).values(
+            name=name, **fields, updated_at=now, updated_by=saved_by
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[kb_documents_table.c.name],
+            set_={**fields, "updated_at": now, "updated_by": saved_by},
+        )
+        conn.execute(stmt)
+        result = conn.execute(
+            kb_revisions_table.insert().values(
+                name=name, **fields, saved_at=now, saved_by=saved_by, note=note
+            )
+        )
+        revision_id = result.inserted_primary_key[0]
+        row = conn.execute(
+            select(app_state_table.c.value).where(app_state_table.c.key == "kb_version")
+        ).first()
+        version = int(row[0]["v"]) if row and isinstance(row[0], dict) else 0
+        _set_app_state("kb_version", {"v": version + 1}, conn=conn)
+    return revision_id
+
+
+def list_kb_revisions(name: str, limit: int = 20) -> list[dict]:
+    stmt = (
+        select(
+            kb_revisions_table.c.id,
+            kb_revisions_table.c.saved_at,
+            kb_revisions_table.c.saved_by,
+            kb_revisions_table.c.note,
+            kb_revisions_table.c.title,
+        )
+        .where(kb_revisions_table.c.name == name)
+        .order_by(kb_revisions_table.c.id.desc())
+        .limit(limit)
+    )
+    with _engine.connect() as conn:
+        rows = conn.execute(stmt).mappings().all()
+    return [{**dict(r), "saved_at": _as_utc(r["saved_at"])} for r in rows]
+
+
+def get_kb_revision(revision_id: int) -> Optional[dict]:
+    with _engine.connect() as conn:
+        row = conn.execute(
+            select(kb_revisions_table).where(kb_revisions_table.c.id == revision_id)
+        ).mappings().first()
+    if row is None:
+        return None
+    return {**dict(row), "saved_at": _as_utc(row["saved_at"])}
