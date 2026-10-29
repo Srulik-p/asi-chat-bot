@@ -39,3 +39,7 @@ Dockerfile
 Dockerfile.server
 .dockerignore
 cloudbuild.server.yaml
+
+# Streamlit secrets — must never enter the image or the repo
+.streamlit/secrets.toml
+**/.streamlit/secrets.toml

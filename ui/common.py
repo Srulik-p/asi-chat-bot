@@ -2,6 +2,7 @@
 
 import hmac
 import os
+from urllib.parse import urlparse
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -86,7 +87,7 @@ def apply_style() -> None:
 # customer's conversation by phone number. Local dev against a localhost
 # backend is exempt; any other backend requires UI_PASSWORD.
 
-_LOCAL_BACKEND = API_URL.startswith(("http://localhost", "http://127.0.0.1"))
+_LOCAL_BACKEND = (urlparse(API_URL).hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
 
 
 def require_staff() -> None:
