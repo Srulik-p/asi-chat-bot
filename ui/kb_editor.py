@@ -211,6 +211,13 @@ index_col, sheet_col = st.columns([1, 3], gap="large")
 # ---------- document index ----------
 
 with index_col:
+    st.session_state.editor_name = st.text_input(
+        "השם שלך",
+        value=st.session_state.editor_name,
+        key="editor_name_input",
+        help="נרשם בהיסטוריית הגרסאות. חובה כדי לשמור.",
+    )
+    editor_name = st.session_state.editor_name.strip()
     query = st.text_input(
         "חיפוש",
         key="kb_query",
@@ -267,39 +274,28 @@ n = st.session_state.kb_load_n
 base_revision_id = doc.get("latest_revision_id")
 
 with sheet_col:
-    head_col, name_col = st.columns([3, 1], vertical_alignment="bottom")
-    with head_col:
-        meta = [f'<span class="kb-file">{html.escape(current)}</span>']
-        if doc.get("hidden"):
-            meta.append('<span class="kb-hidden">מוסתר מהבוט</span>')
-        if base_revision_id is None and current not in st.session_state.kb_names:
-            meta.append("טרם נשמר")
-        elif doc.get("updated_by") == "seed":
-            meta.append("עדיין בגרסה המקורית מהקבצים")
-        elif doc.get("updated_by"):
-            meta.append(
-                f"נשמר לאחרונה על ידי {html.escape(doc['updated_by'])}, "
-                f"{html.escape(_when(doc.get('updated_at')))}"
-            )
-        st.markdown(
-            f'<div class="kb-doc-title" role="heading" aria-level="1">'
-            f'{html.escape(doc["title"] or current)}</div>'
-            f'<p class="kb-meta">{" &nbsp;|&nbsp; ".join(meta)}</p>',
-            unsafe_allow_html=True,
+    meta = [f'<span class="kb-file">{html.escape(current)}</span>']
+    if doc.get("hidden"):
+        meta.append('<span class="kb-hidden">מוסתר מהבוט</span>')
+    if base_revision_id is None and current not in st.session_state.kb_names:
+        meta.append("טרם נשמר")
+    elif doc.get("updated_by") == "seed":
+        meta.append("עדיין בגרסה המקורית מהקבצים")
+    elif doc.get("updated_by"):
+        meta.append(
+            f"נשמר לאחרונה על ידי {html.escape(doc['updated_by'])}, "
+            f"{html.escape(_when(doc.get('updated_at')))}"
         )
-    with name_col:
-        st.session_state.editor_name = st.text_input(
-            "השם שלך",
-            value=st.session_state.editor_name,
-            key="editor_name_input",
-            help="נרשם בהיסטוריית הגרסאות. חובה כדי לשמור.",
-        )
-    editor_name = st.session_state.editor_name.strip()
+    st.markdown(
+        f'<div class="kb-doc-title" role="heading" aria-level="1">'
+        f'{html.escape(doc["title"] or current)}</div>'
+        f'<p class="kb-meta">{" &nbsp;|&nbsp; ".join(meta)}</p>',
+        unsafe_allow_html=True,
+    )
 
     with st.form("kb_editor", border=False):
-        title_col, summary_col = st.columns(2)
-        title = title_col.text_input("כותרת", value=doc["title"], key=f"kb_title_{n}")
-        summary = summary_col.text_input(
+        title = st.text_input("כותרת", value=doc["title"], key=f"kb_title_{n}")
+        summary = st.text_input(
             "תקציר",
             value=doc["summary"],
             key=f"kb_summary_{n}",
@@ -328,7 +324,7 @@ with sheet_col:
         )
 
     if not editor_name:
-        st.caption("כדי לשמור, כתבו את השם שלכם בשדה \"השם שלך\" למעלה.")
+        st.caption("כדי לשמור, כתבו את השם שלכם בשדה \"השם שלך\" מעל רשימת המסמכים.")
 
     status = st.container()
 
