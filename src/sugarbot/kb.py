@@ -1,6 +1,9 @@
-"""Knowledge base: self-describing markdown topic files + a read tool.
+"""Knowledge base: topic documents served from the database + a read tool.
 
-Each file in `knowledge_base/` starts with YAML-ish frontmatter:
+The documents live in the `kb_documents` table (staff edit them live); the
+markdown files in `knowledge_base/` are the seed for migration 0008 and the
+fallback when the database is unreachable. Each file starts with YAML-ish
+frontmatter:
 
     ---
     title: ...
@@ -9,17 +12,44 @@ Each file in `knowledge_base/` starts with YAML-ish frontmatter:
     ---
     # body...
 
+`get_docs()` returns the visible (non-hidden) documents from a per-process
+cache. Instances share no memory, so the cache is keyed on the DB's
+`kb_version` counter: it is re-checked at most once per KB_REFRESH_SECONDS and
+reloaded when another instance (or this one) saved a change. If the database
+errors, the last good snapshot is kept (so a document hidden or edited by
+staff never reverts during a blip) and the database is retried on the next
+refresh window. Only a process with no snapshot yet serves the markdown files
+instead (`kb_version()` is -1).
+
 `build_index()` renders a compact catalog (filenames + titles + keywords)
 that is injected into the cached system prompt, so the model can pick the
 right file straight from its context — no separate search round-trip. The
 single `read_kb` tool then returns the full body of one or more files.
 
-Files whose name starts with `_` are kept in the repo for reference but are
-NOT indexed and NOT exposed to the model (internal notes).
+Hidden documents (and, in the file fallback, files whose name starts with `_`)
+are NOT indexed and NOT exposed to the model (internal notes).
+
+Rollout: once migration 0008 has seeded `kb_documents`, editing the repo
+markdown files no longer changes production; the database is the source of
+truth. Make content changes on the knowledge base page of the staff UI
+(`ui/pages/1_knowledge_base.py`). `KB_REFRESH_SECONDS` (default 30) bounds how
+long an instance can serve a stale snapshot after another instance saves.
+
+Rollback: rolling Cloud Run back to an image older than migration 0008
+crash-loops, because the old image's `alembic upgrade head` cannot locate
+revision 0008. Prefer forward-fixing. If a rollback is unavoidable: export the
+edits first (`GET /kb` plus `GET /kb/{name}` per document), run
+`alembic downgrade 0007` (drops all KB edits and history), then redeploy the
+old image.
 """
 
+import os
 import sys
+import threading
+import time
 from pathlib import Path
+
+from sugarbot import db
 
 KB_DIR = Path(__file__).parent / "knowledge_base"
 
@@ -27,7 +57,7 @@ _DELIM = "---"
 _DELIM_NL = "\n---\n"  # require newline on both sides so body `---` rules don't truncate
 
 
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
+def parse_frontmatter(text: str) -> tuple[dict, str]:
     """Return (meta, body). Minimal parser: title/summary strings, keywords list."""
     if not text.startswith(_DELIM):
         return {}, text
@@ -48,7 +78,10 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     return meta, body
 
 
-def _load() -> dict[str, dict]:
+_parse_frontmatter = parse_frontmatter
+
+
+def _load_files() -> dict[str, dict]:
     docs: dict[str, dict] = {}
     if not KB_DIR.exists():
         return docs
@@ -70,7 +103,59 @@ def _load() -> dict[str, dict]:
     return docs
 
 
-DOCS = _load()
+KB_REFRESH_SECONDS = float(os.getenv("KB_REFRESH_SECONDS", "30"))
+
+# Cache state, guarded by _lock when written. Readers take _docs without the
+# lock; it is only ever rebound to a fully built dict, never mutated.
+_lock = threading.Lock()
+_docs: dict[str, dict] | None = None
+_version = -1  # -1: file fallback
+_checked_at = 0.0
+_fallback_logged = False
+
+
+def refresh(force: bool = False) -> None:
+    """Re-check kb_version (at most once per window unless `force`) and reload on change."""
+    global _docs, _version, _checked_at, _fallback_logged
+    if not force and _docs is not None and time.monotonic() - _checked_at < KB_REFRESH_SECONDS:
+        return
+    with _lock:
+        # Another thread may have refreshed while we waited for the lock.
+        if not force and _docs is not None and time.monotonic() - _checked_at < KB_REFRESH_SECONDS:
+            return
+        try:
+            version = db.get_kb_version()
+            if _docs is None or version != _version:
+                loaded = db.load_kb_documents()
+                _docs = {n: d for n, d in loaded.items() if not d["hidden"]}
+                _version = version
+            _fallback_logged = False
+        except Exception as e:
+            if _version >= 0:
+                # Keep the last good snapshot: the repo files may predate edits
+                # and would resurface documents staff hid.
+                if not _fallback_logged:
+                    print(f"[kb] DB unavailable, keeping cached v{_version}: {e}", file=sys.stderr)
+                    _fallback_logged = True
+            else:
+                if not _fallback_logged:
+                    print(f"[kb] falling back to files: {e}", file=sys.stderr)
+                    _fallback_logged = True
+                _docs = _load_files()
+                _version = -1
+        _checked_at = time.monotonic()
+
+
+def get_docs() -> dict[str, dict]:
+    """Visible documents: {filename: {title, keywords, summary, body, hidden}}."""
+    refresh()
+    return _docs
+
+
+def kb_version() -> int:
+    """The kb_version the cache currently reflects (-1 when serving the files)."""
+    refresh()
+    return _version
 
 
 def build_index() -> str:
@@ -85,7 +170,7 @@ def build_index() -> str:
         "פורמט: `שם_קובץ` — נושא — מילות מפתח",
         "",
     ]
-    for name, d in DOCS.items():
+    for name, d in get_docs().items():
         kw = ", ".join(d["keywords"])
         lines.append(f"- `{name}` — {d['title']} — {kw}")
     return "\n".join(lines)
@@ -95,9 +180,10 @@ def read_kb(filenames: list[str]) -> str:
     """Return the full body of one or more KB files (by filename from the index)."""
     if not filenames:
         return "[לא צוין שם קובץ. בחר/י שם קובץ מהאינדקס שבהוראות המערכת.]"
+    docs = get_docs()
     parts: list[str] = []
     for name in filenames:
-        d = DOCS.get(name.strip())
+        d = docs.get(name.strip())
         if d is None:
             parts.append(f"[קובץ לא נמצא: {name}. בדוק/י שם קובץ באינדקס.]")
         else:

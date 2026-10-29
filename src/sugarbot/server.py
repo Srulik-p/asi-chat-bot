@@ -57,6 +57,36 @@ POST /maintenance/sweep-idle
     Returns: {"scanned": n, "warned": n, "closed": n, "truncated": bool}
     Wire a scheduler (e.g. Cloud Scheduler) to call this hourly.
 
+GET  /kb
+    Headers: X-Internal-Secret
+    Returns: {"version": n, "documents":[{name,title,keywords,summary,hidden,
+             updated_at,updated_by,latest_revision_id}, ...]}  (no bodies;
+             hidden documents included — this is the admin view)
+
+GET  /kb/{name}
+    Headers: X-Internal-Secret
+    Returns: the full document incl. body and latest_revision_id; 404 if missing.
+
+PUT  /kb/{name}
+    Headers: X-Internal-Secret
+    Body:    { title, keywords, summary, body, hidden, saved_by, base_revision_id }
+    Effect:  create or replace the document and record a revision. base_revision_id
+             is the revision the editor loaded (null for a new document); if the
+             document has moved on since, nothing is written.
+    Returns: {"revision_id": n, "version": n}
+             409 {"detail":"conflict","current_revision_id":n} on a stale base;
+             422 on an invalid name or field.
+
+GET  /kb/{name}/revisions?limit=20
+    Headers: X-Internal-Secret
+    Returns: {"revisions":[{id,saved_at,saved_by,note,title}, ...]}  newest first
+
+POST /kb/{name}/restore
+    Headers: X-Internal-Secret
+    Body:    { revision_id, saved_by, base_revision_id }
+    Effect:  save that revision's content as a new revision. Same returns as PUT;
+             404 if the revision does not exist or belongs to another document.
+
 GET  /healthz
 """
 
@@ -83,15 +113,14 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
-from sugarbot import contact, db, notifier
+from sugarbot import contact, db, kb, notifier
 from sugarbot.assistant import (
     ACCOUNT_FRESHNESS_HOURS,
     MAX_TOOL_ROUNDS,
     MODEL,
     REASONING_EFFORT,
-    SYSTEM_PROMPT,
     TOOL_FNS,
     TOOLS,
     _EMAIL_RE,
@@ -102,6 +131,7 @@ from sugarbot.assistant import (
     redact_pii,
     repair_tool_calls,
     scrub_messages,
+    system_prompt,
 )
 
 load_dotenv()
@@ -171,6 +201,7 @@ async def lifespan(_app: FastAPI):
         )
     anyio.to_thread.current_default_thread_limiter().total_tokens = SERVER_THREADPOOL_SIZE
     db.init_db()
+    kb.refresh(force=True)
     # One line per instance start: import->ready is the app's share of a cold
     # start (the Cloud Run request log holds the rest).
     print(f"[boot] ready secs={time.monotonic() - _PROCESS_T0:.2f}", file=sys.stderr)
@@ -357,6 +388,69 @@ class ChatMessageIn(BaseModel):
 
 class ChatResetIn(BaseModel):
     phoneNumber: str
+
+
+KB_NAME_RE = re.compile(r"^_?[a-z0-9][a-z0-9_\-]*\.md$")
+KB_NAME_MAX = 64
+
+
+def _validate_kb_name(name: str) -> None:
+    if len(name) > KB_NAME_MAX or not KB_NAME_RE.fullmatch(name):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid document name")
+
+
+def _require_saved_by(value: str) -> str:
+    # saved_by is the audit trail, so a blank name is rejected rather than stored.
+    value = value.strip()
+    if not value:
+        raise ValueError("saved_by must not be empty")
+    return value
+
+
+class KbDocumentIn(BaseModel):
+    title: str
+    keywords: list[str]
+    summary: str = ""
+    body: str
+    hidden: bool = False
+    saved_by: str
+    base_revision_id: int | None
+
+    @field_validator("title", "body")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty")
+        return v
+
+    # Each document is one line in the system-prompt index.
+    @field_validator("title")
+    @classmethod
+    def _title_single_line(cls, v: str) -> str:
+        v = v.strip()
+        if "\n" in v or "\r" in v:
+            raise ValueError("title must be a single line")
+        return v
+
+    @field_validator("keywords")
+    @classmethod
+    def _keywords_non_empty(cls, v: list[str]) -> list[str]:
+        v = [k.strip() for k in v]
+        if any(not k for k in v):
+            raise ValueError("keywords must be non-empty strings")
+        if any("\n" in k or "\r" in k for k in v):
+            raise ValueError("keywords must be single-line")
+        return v
+
+    _saved_by = field_validator("saved_by")(_require_saved_by)
+
+
+class KbRestoreIn(BaseModel):
+    revision_id: int
+    saved_by: str
+    base_revision_id: int | None
+
+    _saved_by = field_validator("saved_by")(_require_saved_by)
 
 
 # ---------- account-status tool ----------
@@ -1237,7 +1331,7 @@ def _prepare_messages(
     exactly the same conversation.
     """
     batch = batch or []
-    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+    messages: list[dict] = [{"role": "system", "content": system_prompt()}, *history]
     messages = scrub_messages(messages)
     # Attach this turn's media to the user message it came with as multimodal
     # content, so the model actually sees the screenshot/receipt. Past turns keep
@@ -1920,6 +2014,102 @@ def user_delete(
     (unlike /chat/reset, which only clears the chat history)."""
     _check_secret(x_internal_secret, INTERNAL_SECRET, "INTERNAL_API_SECRET")
     return db.delete_user_data(payload.phoneNumber)
+
+
+# ---------- admin: knowledge base ----------
+
+def _save_kb(name: str, fields: dict, *, saved_by: str, note: str | None,
+             base_revision_id: int | None):
+    try:
+        revision_id = db.save_kb_document(
+            name, **fields, saved_by=saved_by, note=note, base_revision_id=base_revision_id
+        )
+    except db.KbConflict as e:
+        # Top-level keys (not HTTPException's nested "detail") — the UI reads
+        # current_revision_id straight off the body.
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": "conflict", "current_revision_id": e.current_revision_id},
+        )
+    # Serve the edit from this instance right away; other instances pick it up
+    # on their next kb_version check.
+    kb.refresh(force=True)
+    return {"revision_id": revision_id, "version": db.get_kb_version()}
+
+
+@app.get("/kb")
+def kb_list(
+    x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
+) -> dict:
+    _check_secret(x_internal_secret, INTERNAL_SECRET, "INTERNAL_API_SECRET")
+    return {"version": db.get_kb_version(), "documents": db.list_kb_documents()}
+
+
+@app.get("/kb/{name}")
+def kb_get(
+    name: str,
+    x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
+) -> dict:
+    _check_secret(x_internal_secret, INTERNAL_SECRET, "INTERNAL_API_SECRET")
+    _validate_kb_name(name)
+    doc = db.get_kb_document(name)
+    if doc is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="document not found")
+    return doc
+
+
+@app.put("/kb/{name}")
+def kb_put(
+    name: str,
+    payload: KbDocumentIn,
+    x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
+):
+    _check_secret(x_internal_secret, INTERNAL_SECRET, "INTERNAL_API_SECRET")
+    _validate_kb_name(name)
+    return _save_kb(
+        name,
+        {
+            "title": payload.title,
+            "keywords": payload.keywords,
+            "summary": payload.summary,
+            "body": payload.body,
+            "hidden": payload.hidden,
+        },
+        saved_by=payload.saved_by,
+        note=None,
+        base_revision_id=payload.base_revision_id,
+    )
+
+
+@app.get("/kb/{name}/revisions")
+def kb_revisions(
+    name: str,
+    limit: Annotated[int, Query(ge=1, le=200)] = 20,
+    x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
+) -> dict:
+    _check_secret(x_internal_secret, INTERNAL_SECRET, "INTERNAL_API_SECRET")
+    _validate_kb_name(name)
+    return {"revisions": db.list_kb_revisions(name, limit=limit)}
+
+
+@app.post("/kb/{name}/restore")
+def kb_restore(
+    name: str,
+    payload: KbRestoreIn,
+    x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
+):
+    _check_secret(x_internal_secret, INTERNAL_SECRET, "INTERNAL_API_SECRET")
+    _validate_kb_name(name)
+    rev = db.get_kb_revision(payload.revision_id)
+    if rev is None or rev["name"] != name:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="revision not found")
+    return _save_kb(
+        name,
+        {k: rev[k] for k in ("title", "keywords", "summary", "body", "hidden")},
+        saved_by=payload.saved_by,
+        note=f"restore #{payload.revision_id}",
+        base_revision_id=payload.base_revision_id,
+    )
 
 
 # ---------- maintenance: inactivity auto-close ----------

@@ -1,6 +1,7 @@
 # Local Python artifacts
 .venv/
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 
@@ -8,6 +9,9 @@ __pycache__/
 .env
 .env.*
 !.env.example
+**/.env
+**/.env.*
+!**/.env.example
 
 # Local SQLite store (user PII — phone numbers, tokens)
 *.db
@@ -35,3 +39,7 @@ Dockerfile
 Dockerfile.server
 .dockerignore
 cloudbuild.server.yaml
+
+# Streamlit secrets — must never enter the image or the repo
+.streamlit/secrets.toml
+**/.streamlit/secrets.toml

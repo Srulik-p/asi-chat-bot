@@ -26,3 +26,7 @@ data/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Streamlit secrets — must never enter the image or the repo
+.streamlit/secrets.toml
+**/.streamlit/secrets.toml

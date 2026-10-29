@@ -1,0 +1,13 @@
+[client]
+toolbarMode = "minimal"
+
+[theme]
+base = "light"
+primaryColor = "#8C1D4E"
+backgroundColor = "#F5F6F8"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1A2233"
+borderColor = "#D9DDE4"
+baseRadius = "small"
+font = "IBM Plex Sans Hebrew:https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Hebrew:wght@400;500;600&display=swap"
+headingFont = "Frank Ruhl Libre:https://fonts.googleapis.com/css2?family=Frank+Ruhl+Libre:wght@500;700&display=swap"
