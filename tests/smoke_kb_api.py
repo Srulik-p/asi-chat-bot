@@ -49,6 +49,7 @@ assert "body" not in r.json()["documents"][0]
 assert c.get("/kb/nope.md", headers=H).status_code == 404
 assert c.get("/kb/pricing.md").status_code == 401
 assert c.get("/kb/Bad Name.md", headers=H).status_code == 422
+assert c.get("/kb/pricing.md%0A", headers=H).status_code == 422   # trailing newline slips past `$`
 doc = c.get("/kb/pricing.md", headers=H).json()
 assert doc["body"] and doc["latest_revision_id"] is None
 
@@ -57,11 +58,14 @@ assert c.put("/kb/pricing.md", json=bad, headers=H).status_code == 422
 assert c.put("/kb/../x.md", json={**bad, "title": "t"}, headers=H).status_code in (404, 422)
 r = c.put("/kb/Bad Name.md", json={**bad, "title": "t"}, headers=H)
 assert r.status_code == 422 and r.json()["detail"] == "invalid document name", r.text
+r = c.put("/kb/pricing.md%0A", json={**bad, "title": "t"}, headers=H)
+assert r.status_code == 422 and r.json()["detail"] == "invalid document name", r.text
 assert c.put("/kb/pricing.md", json={**bad, "title": "t", "body": ""}, headers=H).status_code == 422
 assert c.put("/kb/pricing.md", json={**bad, "title": "t", "keywords": ["a", " "]}, headers=H).status_code == 422
 assert c.put("/kb/pricing.md", json={**bad, "title": "t", "saved_by": "  "}, headers=H).status_code == 422
 assert c.put("/kb/pricing.md", json={**bad, "title": "t"}, headers={"X-Internal-Secret": "x"}).status_code == 401
 assert c.get("/kb", headers=H).json()["version"] == 1   # rejected saves changed nothing
+assert not any(d["name"].endswith("\n") for d in c.get("/kb", headers=H).json()["documents"])
 
 good = {**bad, "title": "מחירים", "body": "גוף 1"}
 r = c.put("/kb/pricing.md", json=good, headers=H); assert r.status_code == 200, r.text

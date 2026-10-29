@@ -394,7 +394,7 @@ KB_NAME_MAX = 64
 
 
 def _validate_kb_name(name: str) -> None:
-    if len(name) > KB_NAME_MAX or not KB_NAME_RE.match(name):
+    if len(name) > KB_NAME_MAX or not KB_NAME_RE.fullmatch(name):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid document name")
 
 
